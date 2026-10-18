@@ -1,0 +1,71 @@
+#pragma once
+// Память GPU (VMA) и указатели на функции ray tracing.
+#include <vulkan/vulkan.h>
+#include <vk_mem_alloc.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace ce::core {
+
+class VulkanContext;
+
+enum class MemUsage { GpuOnly, Upload, Readback };
+
+struct Buffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    void* mapped = nullptr;
+    VkDeviceSize size = 0;
+    VkDeviceAddress address = 0;
+    explicit operator bool() const { return buffer != VK_NULL_HANDLE; }
+};
+
+struct Image {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{};
+};
+
+struct RtFunctions {
+    PFN_vkCreateAccelerationStructureKHR createAs = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR destroyAs = nullptr;
+    PFN_vkGetAccelerationStructureBuildSizesKHR buildSizes = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR cmdBuild = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR asAddress = nullptr;
+};
+
+class Gpu {
+public:
+    explicit Gpu(const VulkanContext& ctx);
+    ~Gpu();
+
+    Gpu(const Gpu&) = delete;
+    Gpu& operator=(const Gpu&) = delete;
+
+    // shared=true — буфер доступен всем семьям очередей без ownership transfer (для GPU-лейнов UniX)
+    Buffer CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, MemUsage mem, bool shared = false,
+                        VkDeviceSize alignment = 0);
+    void Destroy(Buffer& b);
+
+    Image CreateImage2D(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                        uint32_t layers = 1);
+    void Destroy(Image& img);
+
+    VkDevice Device() const { return m_device; }
+    const RtFunctions& Rt() const { return m_rt; }
+    bool RayTracing() const { return m_rtSupported; }
+    VkDeviceSize ScratchAlignment() const { return m_scratchAlign; }
+
+private:
+    VkDevice m_device;
+    VmaAllocator m_allocator = nullptr;
+    RtFunctions m_rt;
+    bool m_rtSupported;
+    VkDeviceSize m_scratchAlign = 256;
+    std::vector<uint32_t> m_families;
+};
+
+} // namespace ce::core
