@@ -778,7 +778,7 @@ void Renderer::Prepare(Task& task) {
     FrameUbo ubo{};
     ShadowCull cull{};
     ubo.viewProj = Mat4::PerspectiveReverseZ(fov, aspect, 0.05f) * Mat4::LookAt(camPos, camPos + fwd, {0, 1, 0});
-    ubo.camPos = {camPos, static_cast<float>(Core().time)};
+    ubo.camPos = {camPos, static_cast<float>(Core().time.load(std::memory_order_relaxed))};
     ubo.camForward = {fwd, tanV};
     ubo.camRight = {right, aspect};
     ubo.camUp = {up, 0};
@@ -918,12 +918,16 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
     // Ресурсы, загруженные через transfer/compute лейны, делаем видимыми графической очереди
-    if (m_meshes->ConsumeNewResources())
-        MemBarrier(cmd, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                      VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
-                          (m_rtSupported ? VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR : 0),
-                      VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
-                          (m_rtSupported ? VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR : 0));
+    // Загрузки мешей (копирование, сборка BLAS) делаем видимыми каждый кадр. Флаг «были новые меши»
+    // не годится: меш, ставший готовым между Record и следующим Prepare, рисовался без барьера.
+    // Если очередь у загрузок своя, порядок уже дал fence на CPU, а барьер даёт видимость памяти;
+    // если очередь общая (llvmpipe, часть iGPU), барьер ещё и упорядочивает исполнение.
+    MemBarrier(cmd, VK_PIPELINE_STAGE_2_COPY_BIT | (m_rtSupported ? VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR : 0),
+               VK_ACCESS_2_TRANSFER_WRITE_BIT | (m_rtSupported ? VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR : 0),
+               VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                   (m_rtSupported ? VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR : 0),
+               VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
+                   (m_rtSupported ? VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR : 0));
 
     if (f.rt) {
         VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
@@ -1016,9 +1020,11 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
     }
 
     vkCmdEndRendering(cmd);
+    // dstStage = COLOR_ATTACHMENT_OUTPUT: та же стадия, на которой сигналится семафор для present, —
+    // так переход layout гарантированно завершён до сигнала
     ImageBarrier(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
+                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE);
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
 

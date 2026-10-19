@@ -186,11 +186,11 @@ int Engine::Run(Game& game, const EngineConfig& requested) {
             const auto now = clock::now();
             const float dt = std::min(std::chrono::duration<float>(now - prev).count(), 0.25f);
             prev = now;
-            ec.time = std::chrono::duration<double>(now - start).count();
-            ec.dt = dt;
-            ++ec.frame;
+            ec.time.store(std::chrono::duration<double>(now - start).count());
+            ec.dt.store(dt);
+            ec.frame.fetch_add(1);
 
-            scheduler.BeginFrame(ec.time, dt, ec.frame);
+            scheduler.BeginFrame(ec.time.load(), dt, ec.frame.load());
             scheduler.RunStage(Stage::Update);
             {
                 CE_ZONE("World.Flush");
@@ -240,9 +240,9 @@ void Engine::Quit() {
     if (auto* c = core::CorePtr())
         c->quit.store(true);
 }
-double Engine::Time() { return core::Core().time; }
-float Engine::DeltaTime() { return core::Core().dt; }
-uint64_t Engine::Frame() { return core::Core().frame; }
+double Engine::Time() { return core::Core().time.load(std::memory_order_relaxed); }
+float Engine::DeltaTime() { return core::Core().dt.load(std::memory_order_relaxed); }
+uint64_t Engine::Frame() { return core::Core().frame.load(std::memory_order_relaxed); }
 const SystemInfo& Engine::System() { return core::Core().system; }
 
 // ---------------- Input ----------------

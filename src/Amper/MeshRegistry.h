@@ -46,8 +46,6 @@ public:
         const MeshGpu& m = m_meshes[id];
         return m.ready.load(std::memory_order_acquire) ? &m : nullptr;
     }
-    // Были ли загружены новые ресурсы с прошлого кадра (нужен барьер видимости в графической очереди)
-    bool ConsumeNewResources() { return m_newResources.exchange(false); }
 
     static void GenCube(std::vector<Vertex>& v, std::vector<uint32_t>& i);
     static void GenSphere(std::vector<Vertex>& v, std::vector<uint32_t>& i, uint32_t segments);
@@ -62,7 +60,6 @@ private:
     GpuLanes& m_lanes;
     std::unique_ptr<MeshGpu[]> m_meshes;
     std::atomic<uint32_t> m_count{0};
-    std::atomic<bool> m_newResources{false};
     std::mutex m_primitiveMutex;
     std::unordered_map<std::string, uint32_t> m_primitives;
 };
