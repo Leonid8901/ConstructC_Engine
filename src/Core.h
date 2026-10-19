@@ -71,6 +71,16 @@ struct Access {
         m.m_id = id;
         return m;
     }
+    static Texture MakeTexture(uint32_t id) {
+        Texture t;
+        t.m_id = id;
+        return t;
+    }
+    static Model MakeModel(uint32_t id) {
+        Model m;
+        m.m_id = id;
+        return m;
+    }
 
     static Light MakeLight(uint32_t index, uint32_t gen) {
         Light l;

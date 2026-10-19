@@ -93,6 +93,21 @@ void MemBarrier(VkCommandBuffer cmd, VkPipelineStageFlags2 srcStage, VkAccessFla
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
+// Material -> данные инстанса. Индексы текстур: UINT32_MAX — нет текстуры.
+void WriteMaterial(GpuInstance& g, const Material& m) {
+    g.colorRough = {m.color, m.roughness};
+    g.emissiveMetal = {m.emissive, m.metallic};
+    g.tex[0] = m.baseColorMap.Id();
+    g.tex[1] = m.metallicRoughnessMap.Id();
+    g.tex[2] = m.normalMap.Id();
+    g.tex[3] = m.emissiveMap.Id();
+    const uint32_t occ = m.occlusionMap.Id();
+    float occBits;
+    std::memcpy(&occBits, &occ, sizeof(occBits));
+    g.params = {m.normalScale, m.alphaCutoff, m.occlusionStrength, occBits};
+    g.extra = {m.uvScale.x, m.uvScale.y, m.doubleSided ? 1.0f : 0.0f, 0};
+}
+
 } // namespace
 
 Renderer::Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& window, const EngineConfig& config)
@@ -101,6 +116,8 @@ Renderer::Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& 
     m_rtEnabled.store(config.rayTracing && m_rtSupported);
     m_swapchain = std::make_unique<Swapchain>(ctx, window, config.vsync);
     m_meshes = std::make_unique<MeshRegistry>(gpu, lanes);
+    m_textures = std::make_unique<TextureRegistry>(ctx, gpu, lanes);
+    m_models = std::make_unique<ModelRegistry>(*m_meshes, *m_textures);
 
     // Форматы глубины: D32 есть почти везде на ПК; спецификация гарантирует D16 и один из X8_D24/D32
     auto supports = [&](VkFormat f, VkFormatFeatureFlags need) {
@@ -193,6 +210,8 @@ Renderer::~Renderer() {
     vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
     m_gpu.Destroy(m_depth);
     m_gpu.Destroy(m_msaaColor);
+    m_models.reset();
+    m_textures.reset();
     m_meshes.reset();
     m_swapchain.reset();
 }
@@ -434,15 +453,17 @@ void Renderer::EnsureTlasCapacity(Frame& f, uint32_t count) {
 void Renderer::CreatePipelines() {
     m_colorFormat = m_swapchain->Format();
 
+    // set 0 — данные кадра (по набору на кадр в полёте), set 1 — общий bindless-массив текстур
+    const VkDescriptorSetLayout sets[2] = {m_setLayout, m_textures->Layout()};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    li.setLayoutCount = 1;
-    li.pSetLayouts = &m_setLayout;
+    li.setLayoutCount = 2;
+    li.pSetLayouts = sets;
     VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(uint32_t)};  // индекс каскада
     li.pushConstantRangeCount = 1;
     li.pPushConstantRanges = &push;
     VK_CHECK(vkCreatePipelineLayout(m_device, &li, nullptr, &m_pipelineLayout));
 
-    auto build = [&](const char* vs, const char* fs, bool mesh, bool shadow = false) {
+    auto build = [&](const char* vs, const char* fs, bool mesh, bool shadow = false, bool twoSided = false) {
         VkShaderModule vert = LoadShader(m_device, vs);
         VkShaderModule frag = fs ? LoadShader(m_device, fs) : VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo stages[2]{};
@@ -450,15 +471,17 @@ void Renderer::CreatePipelines() {
         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
 
         VkVertexInputBindingDescription vb{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-        VkVertexInputAttributeDescription attrs[2] = {
+        VkVertexInputAttributeDescription attrs[4] = {
             {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
             {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+            {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
+            {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, tangent)},
         };
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         if (mesh) {
             vi.vertexBindingDescriptionCount = 1;
             vi.pVertexBindingDescriptions = &vb;
-            vi.vertexAttributeDescriptionCount = shadow ? 1 : 2;
+            vi.vertexAttributeDescriptionCount = shadow ? 1 : 4;
             vi.pVertexAttributeDescriptions = attrs;
         }
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -468,7 +491,7 @@ void Renderer::CreatePipelines() {
         vp.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode = mesh ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+        rs.cullMode = mesh && !twoSided ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
         rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rs.lineWidth = 1.0f;
         if (shadow) {
@@ -521,19 +544,22 @@ void Renderer::CreatePipelines() {
 
     m_skyPipeline = build("sky.vert.spv", "sky.frag.spv", false);
     m_meshPipeline = build("mesh.vert.spv", "mesh.frag.spv", true);
+    m_meshPipeline2s = build("mesh.vert.spv", "mesh.frag.spv", true, false, true);
     m_shadowPipeline = build("shadow.vert.spv", nullptr, true, true);
-    if (m_rtSupported)
+    if (m_rtSupported) {
         m_meshRtPipeline = build("mesh.vert.spv", "mesh_rt.frag.spv", true);
+        m_meshRtPipeline2s = build("mesh.vert.spv", "mesh_rt.frag.spv", true, false, true);
+    }
 }
 
 void Renderer::DestroyPipelines() {
-    vkDestroyPipeline(m_device, m_skyPipeline, nullptr);
-    vkDestroyPipeline(m_device, m_meshPipeline, nullptr);
-    vkDestroyPipeline(m_device, m_shadowPipeline, nullptr);
-    if (m_meshRtPipeline)
-        vkDestroyPipeline(m_device, m_meshRtPipeline, nullptr);
+    for (VkPipeline p : {m_skyPipeline, m_meshPipeline, m_meshPipeline2s, m_shadowPipeline, m_meshRtPipeline,
+                         m_meshRtPipeline2s})
+        if (p)
+            vkDestroyPipeline(m_device, p, nullptr);
     vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-    m_skyPipeline = m_meshPipeline = m_shadowPipeline = m_meshRtPipeline = VK_NULL_HANDLE;
+    m_skyPipeline = m_meshPipeline = m_meshPipeline2s = m_shadowPipeline = m_meshRtPipeline = m_meshRtPipeline2s =
+        VK_NULL_HANDLE;
     m_pipelineLayout = VK_NULL_HANDLE;
 }
 
@@ -730,22 +756,35 @@ void Renderer::Prepare(Task& task) {
     const uint32_t cap = world.Capacity();
     const uint32_t meshCount = m_meshes->Count();
 
-    // 1. Ранг каждой сущности внутри своего меша (последовательно, дёшево)
-    m_slot.resize(cap);
-    m_meshCounts.assign(meshCount, 0);
+    // 1. Список инстансов (сущность с мешем — один, с моделью — по одному на часть) и ранг внутри
+    //    группы отрисовки. Группа = меш + односторонний/двусторонний: один draw на группу.
+    //    Последовательно и дёшево; тяжёлая работа — в ParallelFor ниже.
+    const uint32_t groups = meshCount * 2;
+    m_meshCounts.assign(groups, 0);
+    m_refs.clear();
+    auto add = [&](uint32_t entity, uint32_t part, uint32_t mesh, bool twoSided) {
+        if (mesh >= meshCount || !m_meshes->Get(mesh))
+            return;
+        const uint32_t key = (twoSided ? meshCount : 0) + mesh;
+        m_refs.push_back({entity, part, key, m_meshCounts[key]++});
+    };
     for (uint32_t i = 0; i < cap; ++i) {
         const EntityData& d = world.At(i);
-        if (!d.alive || !d.visible || d.mesh >= meshCount || !m_meshes->Get(d.mesh)) {
-            m_slot[i] = UINT32_MAX;
+        if (!d.alive || !d.visible)
             continue;
+        if (d.model != UINT32_MAX) {
+            if (const ModelData* md = m_models->Get(d.model))
+                for (uint32_t p = 0; p < md->parts.size(); ++p)
+                    add(i, p, md->parts[p].mesh, md->parts[p].material.doubleSided);
+        } else if (d.mesh != UINT32_MAX) {
+            add(i, UINT32_MAX, d.mesh, d.material.doubleSided);
         }
-        m_slot[i] = m_meshCounts[d.mesh]++;
     }
-    m_meshOffsets.resize(meshCount);
+    m_meshOffsets.resize(groups);
     uint32_t total = 0;
-    for (uint32_t m = 0; m < meshCount; ++m) {
-        m_meshOffsets[m] = total;
-        total += m_meshCounts[m];
+    for (uint32_t g = 0; g < groups; ++g) {
+        m_meshOffsets[g] = total;
+        total += m_meshCounts[g];
     }
 
     f.rt = m_rtEnabled.load() && m_rtSupported;
@@ -820,20 +859,22 @@ void Renderer::Prepare(Task& task) {
     // копируем целиком, чтобы не читать из этой памяти (битовые поля TLAS-инстанса читают слово).
     auto* instances = static_cast<GpuInstance*>(f.instances.mapped);
     auto* tlas = f.rt ? static_cast<VkAccelerationStructureInstanceKHR*>(f.tlasInstances.mapped) : nullptr;
-    task.ParallelFor(cap, [&](uint32_t begin, uint32_t end) {
-        for (uint32_t i = begin; i < end; ++i) {
-            if (m_slot[i] == UINT32_MAX)
-                continue;
-            const EntityData& d = world.At(i);
-            const MeshGpu* mesh = m_meshes->Get(d.mesh);
-            const uint32_t idx = m_meshOffsets[d.mesh] + m_slot[i];
-            const Mat4 model = Mat4::TRS(d.pos, d.rot, d.scale);
+    const uint32_t refCount = static_cast<uint32_t>(m_refs.size());
+    task.ParallelFor(refCount, [&](uint32_t begin, uint32_t end) {
+        for (uint32_t ri = begin; ri < end; ++ri) {
+            const InstanceRef& ref = m_refs[ri];
+            const EntityData& d = world.At(ref.entity);
+            const ModelPart* part =
+                ref.part == UINT32_MAX ? nullptr : &m_models->Get(d.model)->parts[ref.part];
+            const Material& mat = part ? part->material : d.material;
+            const MeshGpu* mesh = m_meshes->Get(part ? part->mesh : d.mesh);
+            const uint32_t idx = m_meshOffsets[ref.key] + ref.slot;
+            const Mat4 entityM = Mat4::TRS(d.pos, d.rot, d.scale);
+            const Mat4 model = part ? entityM * part->local : entityM;
 
             GpuInstance g;
             std::memcpy(g.model, model.m, sizeof(g.model));
-            g.invScale2 = {1.0f / (d.scale.x * d.scale.x), 1.0f / (d.scale.y * d.scale.y), 1.0f / (d.scale.z * d.scale.z), 0};
-            g.colorRough = {d.material.color, d.material.roughness};
-            g.emissiveMetal = {d.material.emissive, d.material.metallic};
+            WriteMaterial(g, mat);
             std::memcpy(&instances[idx], &g, sizeof(g));
 
             if (tlas) {
@@ -849,10 +890,9 @@ void Renderer::Prepare(Task& task) {
                 std::memcpy(&tlas[idx], &ti, sizeof(ti));
             }
 
-            // Ограничивающая сфера в мире
+            // Ограничивающая сфера в мире (MaxScale учитывает и масштаб узла модели)
             const Vec3 c = model.TransformPoint(mesh->boundCenter);
-            const Vec3 as = Abs(d.scale);
-            const float r = mesh->boundRadius * std::max(as.x, std::max(as.y, as.z));
+            const float r = mesh->boundRadius * model.MaxScale();
 
             uint8_t mask = 1;
             for (const Vec4& p : planes)
@@ -881,17 +921,17 @@ void Renderer::Prepare(Task& task) {
     auto build = [&](uint8_t bit, std::vector<Draw>& draws) {
         draws.clear();
         uint32_t drawn = 0;
-        for (uint32_t m = 0; m < meshCount; ++m) {
-            const uint32_t count = m_meshCounts[m];
+        for (uint32_t g = 0; g < groups; ++g) {  // сначала все односторонние группы, потом двусторонние
+            const uint32_t count = m_meshCounts[g];
             if (count == 0)
                 continue;
-            const uint32_t base = m_meshOffsets[m];
+            const uint32_t base = m_meshOffsets[g];
             const uint32_t first = written;
             for (uint32_t k = 0; k < count; ++k)
                 if (m_visMask[base + k] & bit)
                     out[written++] = base + k;
             if (written > first) {
-                draws.push_back({m, first, written - first});
+                draws.push_back({g % meshCount, first, written - first, g >= meshCount});
                 drawn += written - first;
             }
         }
@@ -951,7 +991,8 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
                       VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     }
 
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &f.set, 0, nullptr);
+    const VkDescriptorSet sets[2] = {f.set, m_textures->Set()};
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2, sets, 0, nullptr);
     if (f.shadows)
         RecordShadowPass(f);
 
@@ -1010,8 +1051,14 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_skyPipeline);
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, f.rt ? m_meshRtPipeline : m_meshPipeline);
+    int bound = -1;  // 0 — односторонний пайплайн, 1 — двусторонний (списки отсортированы: сначала односторонние)
     for (const Draw& d : f.draws) {
+        if (bound != (d.doubleSided ? 1 : 0)) {
+            bound = d.doubleSided ? 1 : 0;
+            VkPipeline p = f.rt ? (d.doubleSided ? m_meshRtPipeline2s : m_meshRtPipeline)
+                                : (d.doubleSided ? m_meshPipeline2s : m_meshPipeline);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        }
         const MeshGpu* mesh = m_meshes->Get(d.mesh);
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertices.buffer, &offset);

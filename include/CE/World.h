@@ -16,13 +16,42 @@ namespace core { struct Access; }
 struct Vertex {
     Vec3 position;
     Vec3 normal;
+    Vec2 uv{};                    // текстурные координаты (0,0 — левый верх, как в glTF)
+    Vec4 tangent{1, 0, 0, 1};     // xyz — касательная, w = ±1 (направление битангенса); Mesh::Create считает сам
 };
 
+// Текстура (PNG, JPEG, TGA, BMP, HDR→8 бит). Дескриптор: индекс в общем массиве текстур GPU.
+class Texture {
+public:
+    Texture() = default;
+    // srgb = true для цвета (baseColor, emissive), false для данных (нормали, roughness/metallic)
+    static Texture Load(const std::string& path, bool srgb = true);
+    static Texture Create(const uint8_t* rgba8, uint32_t width, uint32_t height, bool srgb = true);
+    bool Valid() const { return m_id != UINT32_MAX; }
+    uint32_t Id() const { return m_id; }
+
+private:
+    friend struct core::Access;
+    uint32_t m_id = UINT32_MAX;
+};
+
+// PBR-материал (metallic/roughness, как в glTF). Текстуры необязательны: без текстуры берётся число,
+// с текстурой — число умножается на текстуру.
 struct Material {
     Vec3 color{0.8f, 0.8f, 0.8f};
     float roughness = 0.5f;
     float metallic = 0.0f;
     Vec3 emissive{};
+    Texture baseColorMap{};          // RGB — цвет, A — прозрачность для alphaCutoff
+    Texture metallicRoughnessMap{};  // G — roughness, B — metallic (как в glTF)
+    Texture normalMap{};             // карта нормалей в касательном пространстве
+    Texture emissiveMap{};
+    Texture occlusionMap{};          // R — затенение окружения (ambient occlusion)
+    float normalScale = 1.0f;
+    float occlusionStrength = 1.0f;
+    float alphaCutoff = 0.0f;      // > 0: пиксели с альфой ниже порога отбрасываются (листва, решётки)
+    bool doubleSided = false;      // рисовать обе стороны треугольников
+    Vec2 uvScale{1, 1};            // повтор текстур (для Mesh::Plane UV уже в метрах)
 };
 
 // Примитивы единичного размера: куб 1x1x1, сфера диаметром 1, плоскость size x size.
@@ -33,11 +62,31 @@ public:
     static Mesh Sphere(uint32_t segments = 32);
     static Mesh Plane(float size = 1.0f);
     static Mesh Capsule(float radius = 0.5f, float halfHeight = 0.5f, uint32_t segments = 24);
+    // Касательные (Vertex::tangent) считаются по UV автоматически, если у всех вершин они по умолчанию
     static Mesh Create(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices);
     static Mesh LoadOBJ(const std::string& path);
 
     bool Valid() const { return m_id != UINT32_MAX; }
     uint32_t Id() const { return m_id; }
+
+private:
+    friend struct core::Access;
+    uint32_t m_id = UINT32_MAX;
+};
+
+// Модель glTF 2.0 (.gltf + .bin + картинки или один .glb): меши, PBR-материалы, текстуры, иерархия
+// узлов. Иерархия запекается в «части» (меш + материал + локальная матрица); сущность с моделью рисует
+// все части. Загрузка синхронная — тяжёлые модели удобно грузить из фоновой задачи (UniX Once Extreme).
+class Model {
+public:
+    Model() = default;
+    static Model Load(const std::string& path);
+
+    bool Valid() const { return m_id != UINT32_MAX; }
+    uint32_t Id() const { return m_id; }
+    uint32_t PartCount() const;
+    Vec3 BoundsMin() const;  // в координатах модели, поза по умолчанию
+    Vec3 BoundsMax() const;
 
 private:
     friend struct core::Access;
@@ -69,6 +118,7 @@ public:
     Entity& SetScale(float s) { return SetScale(Vec3(s)); }
 
     Entity& SetMesh(Mesh mesh);
+    Entity& SetModel(Model model);  // вместо меша; материалы берутся из модели, Material сущности не используется
     Entity& SetMaterial(const Material& m);
     Entity& SetColor(Vec3 c);
     Entity& SetVisible(bool v);

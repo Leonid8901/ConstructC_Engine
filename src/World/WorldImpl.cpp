@@ -200,7 +200,14 @@ void WorldImpl::Apply(const Command& c) {
         if (d.body != UINT32_MAX) ph.SetRotation(d.body, d.rot);
         break;
     case CmdType::SetScale: d.scale = c.v; break;
-    case CmdType::SetMesh: d.mesh = c.u; break;
+    case CmdType::SetMesh:
+        d.mesh = c.u;
+        d.model = UINT32_MAX;
+        break;
+    case CmdType::SetModel:
+        d.model = c.u;
+        d.mesh = UINT32_MAX;
+        break;
     case CmdType::SetMaterial: d.material = c.material; break;
     case CmdType::SetColor: d.material.color = c.v; break;
     case CmdType::SetVisible: d.visible = c.u != 0; break;

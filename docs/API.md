@@ -162,18 +162,68 @@ public:
 | `Create(vertices, indices)` | пользовательская геометрия |
 | `LoadOBJ(path)` | загрузка OBJ; бросает `std::runtime_error`, если файл не загружен |
 
-Поддерживаемое подмножество OBJ: `v`, `vn`, `f`; многоугольники разбиваются веером; без нормалей в файле используются плоские нормали. Текстурные координаты, материалы и группы игнорируются.
+Поддерживаемое подмножество OBJ: `v`, `vt`, `vn`, `f` (форматы `v`, `v/vt`, `v//vn`, `v/vt/vn`, отрицательные индексы); многоугольники разбиваются веером; грань без нормалей получает плоскую нормаль. Материалы (`mtllib`/`usemtl`) и группы игнорируются — для моделей с материалами используйте glTF ([Model](#model)).
+
+Касательные (`Vertex::tangent`, для карт нормалей) `Create` и `LoadOBJ` считают сами по UV, если у всех вершин они по умолчанию. У примитивов UV есть: куб — 0…1 на грань, сфера/капсула — широта/долгота, плоскость — в метрах (текстура повторяется каждый метр).
 
 Примитивы кэшируются по параметрам: повторный вызов с теми же аргументами возвращает тот же меш. `Create` и `LoadOBJ` кэширования не делают. Геометрия загружается на GPU синхронно через очередь transfer; если устройство поддерживает RT, для меша сразу строится BLAS.
+
+## Model
+
+```cpp
+class Model {
+public:
+    static Model Load(const std::string& path);  // .gltf (+ .bin + картинки) или .glb
+    bool Valid() const;
+    uint32_t PartCount() const;                  // сколько мешей с материалами (частей)
+    Vec3 BoundsMin() const, BoundsMax() const;   // в координатах модели
+};
+
+Entity hero = World.Spawn().SetModel(Model::Load("assets/hero.glb")).SetPosition({0, 0, 0});
+```
+
+glTF 2.0: меши (треугольники), иерархия узлов, PBR-материалы metallic/roughness, текстуры (PNG/JPEG внутри .glb, рядом с .gltf или base64), `KHR_materials_emissive_strength`. Иерархия запекается: модель — набор частей «меш + материал + матрица узла», сущность с моделью рисует все части со своей позицией/поворотом/масштабом. Повторный `Load` того же пути возвращает ту же модель.
+
+Что не поддерживается: `alphaMode: BLEND` (рисуется как MASK с порогом 0,5, в логе предупреждение), второй набор UV (`TEXCOORD_1`), `KHR_texture_transform`, сэмплеры glTF (везде repeat + трилинейная + анизотропия), Draco/meshopt-сжатие, морфинг. Ошибка в одной текстуре не роняет модель: текстура пропускается с сообщением в логе; битый файл модели — исключение `std::runtime_error`.
+
+Загрузка синхронная (чтение, декодирование картинок, мипы, загрузка на GPU). Большие модели удобно грузить из фоновой задачи: `UniX.CreateTask.Once("Load", Cost::Extreme, ...)`.
+
+Физика с моделью: тело задаётся формой как обычно; размер удобно взять из `BoundsMin/BoundsMax`.
+
+## Texture
+
+```cpp
+Texture t = Texture::Load("assets/bricks.png");           // srgb = true: цвет
+Texture n = Texture::Load("assets/bricks_n.png", false);  // данные: нормали, roughness/metallic
+Texture c = Texture::Create(rgba8, width, height);        // из памяти (RGBA, строки сверху вниз)
+```
+
+PNG, JPEG, TGA, BMP, PSD, HDR (stb_image, HDR приводится к 8 битам). Мипы генерируются на GPU. Повторный `Load` того же файла возвращает ту же текстуру. Все текстуры живут в одном bindless-массиве (до 4096, или меньше, если так ограничивает GPU).
 
 ## Material и Vertex
 
 ```cpp
-struct Vertex   { Vec3 position; Vec3 normal; };
-struct Material { Vec3 color{0.8,0.8,0.8}; float roughness = 0.5f; float metallic = 0.0f; Vec3 emissive{}; };
+struct Vertex {
+    Vec3 position;
+    Vec3 normal;
+    Vec2 uv{};                 // 0,0 — левый верх (как в glTF)
+    Vec4 tangent{1, 0, 0, 1};  // w = ±1; Mesh::Create посчитает сам
+};
+
+struct Material {
+    Vec3  color{0.8f, 0.8f, 0.8f};
+    float roughness = 0.5f;
+    float metallic  = 0.0f;
+    Vec3  emissive{};
+    Texture baseColorMap, metallicRoughnessMap, normalMap, emissiveMap, occlusionMap;
+    float normalScale = 1, occlusionStrength = 1;
+    float alphaCutoff = 0;      // > 0: пиксели с альфой ниже порога отбрасываются
+    bool  doubleSided = false;  // без отсечения задних граней
+    Vec2  uvScale{1, 1};        // повтор текстур
+};
 ```
 
-Подробности модели — [Amper.md](Amper.md#2-модель-освещения).
+Числа умножаются на текстуры (как в glTF): `color × baseColorMap.rgb`, `roughness × mr.g`, `metallic × mr.b`, `emissive × emissiveMap.rgb`. Подробности модели — [Amper.md](Amper.md#2-модель-освещения).
 
 ## Camera
 

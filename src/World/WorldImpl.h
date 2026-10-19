@@ -21,6 +21,7 @@ struct EntityData {
     Vec3 velocity;
     Material material;
     uint32_t mesh = UINT32_MAX;
+    uint32_t model = UINT32_MAX;  // модель вместо меша (части рисует Amper)
     uint32_t body = UINT32_MAX;
     uint32_t gen = 0;
     bool alive = false;
@@ -37,7 +38,7 @@ struct EntityData {
 
 enum class CmdType : uint8_t {
     Create, Destroy, SetPos, SetRot, SetScale, SetMesh, SetMaterial, SetColor, SetVisible,
-    AddBody, RemoveBody, SetVel, SetAngVel, AddForce, AddImpulse, SetOutOfBounds, SetHome
+    AddBody, RemoveBody, SetVel, SetAngVel, AddForce, AddImpulse, SetOutOfBounds, SetHome, SetModel
 };
 
 struct WorldBounds {

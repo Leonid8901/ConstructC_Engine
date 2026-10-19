@@ -52,6 +52,7 @@ public:
     static void GenPlane(std::vector<Vertex>& v, std::vector<uint32_t>& i, float size);
     static void GenCapsule(std::vector<Vertex>& v, std::vector<uint32_t>& i, float radius, float halfHeight, uint32_t segments);
     static bool LoadObj(const std::string& path, std::vector<Vertex>& v, std::vector<uint32_t>& i);
+    static void ComputeTangents(std::vector<Vertex>& v, const std::vector<uint32_t>& i);
 
 private:
     void BuildBlas(MeshGpu& mesh);

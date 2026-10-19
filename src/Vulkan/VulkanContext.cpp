@@ -157,11 +157,20 @@ bool VulkanContext::IsDeviceSuitable(VkPhysicalDevice device, QueueFamilies& out
     }
 
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.pNext = &f13;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.pNext = &f13;
+    f2.pNext = &f12;
     vkGetPhysicalDeviceFeatures2(device, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2) {
         reason = "нет dynamicRendering/synchronization2";
+        return false;
+    }
+    // Bindless-текстуры и адреса буферов: в Vulkan 1.3 обязательны, но проверяем явно
+    if (!f12.bufferDeviceAddress || !f12.runtimeDescriptorArray || !f12.descriptorBindingPartiallyBound ||
+        !f12.descriptorBindingSampledImageUpdateAfterBind || !f12.descriptorBindingUpdateUnusedWhilePending ||
+        !f12.descriptorBindingVariableDescriptorCount || !f12.shaderSampledImageArrayNonUniformIndexing) {
+        reason = "нет descriptor indexing / buffer device address";
         return false;
     }
 
@@ -364,10 +373,21 @@ void VulkanContext::CreateDevice() {
         f13.pNext = &as;
 
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    f12.bufferDeviceAddress = m_rtSupported ? VK_TRUE : VK_FALSE;
+    f12.bufferDeviceAddress = VK_TRUE;  // скиннинг и RT берут буферы по адресу
+    // Bindless: один массив всех текстур, индекс текстуры лежит в данных инстанса
+    f12.runtimeDescriptorArray = VK_TRUE;
+    f12.descriptorBindingPartiallyBound = VK_TRUE;
+    f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    f12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    f12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+    f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     f12.pNext = &f13;
 
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(m_physicalDevice, &supported);
+    m_anisotropy = supported.samplerAnisotropy == VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.features.samplerAnisotropy = m_anisotropy ? VK_TRUE : VK_FALSE;
     f2.pNext = &f12;
 
     std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
