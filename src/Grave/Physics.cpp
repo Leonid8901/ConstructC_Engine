@@ -1,6 +1,7 @@
 #include "Grave/Physics.h"
 #include "Core.h"
 #include "Grave/Collision.h"
+#include "Profile.h"
 #include "World/WorldImpl.h"
 
 #include <algorithm>
@@ -235,6 +236,7 @@ bool Physics::Active(const Body& b) const {
 }
 
 void Physics::Broadphase() {
+    CE_ZONE("Grave.Broadphase");
     if (m_topologyDirty) {
         m_sapOrder.clear();
         m_planes.clear();
@@ -307,6 +309,7 @@ uint32_t Physics::Find(uint32_t i) {
 }
 
 void Physics::BuildIslands() {
+    CE_ZONE("Grave.Islands");
     const uint32_t n = static_cast<uint32_t>(m_bodies.size());
     m_parent.resize(n);
     for (uint32_t i = 0; i < n; ++i)
@@ -474,6 +477,7 @@ void Physics::SolveIsland(uint32_t island, float h) {
 }
 
 void Physics::FixedStep(Task& task, float h) {
+    CE_ZONE("Grave.FixedStep");
     const uint32_t n = static_cast<uint32_t>(m_bodies.size());
     if (n == 0)
         return;

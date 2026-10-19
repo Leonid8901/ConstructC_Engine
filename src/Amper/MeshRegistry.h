@@ -22,6 +22,8 @@ struct MeshGpu {
     Buffer indices;
     uint32_t indexCount = 0;
     uint32_t vertexCount = 0;
+    Vec3 boundCenter{};      // ограничивающая сфера в локальных координатах меша
+    float boundRadius = 0;
     Buffer blasBuffer;
     VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
     VkDeviceAddress blasAddress = 0;

@@ -10,7 +10,10 @@ namespace ce::core {
 
 class VulkanContext;
 
-enum class MemUsage { GpuOnly, Upload, Readback };
+// Stream — данные, которые CPU пишет каждый кадр, а GPU читает (инстансы, UBO, свет).
+// Предпочитает видеопамять, видимую CPU (окно BAR 256 МБ или Resizable BAR); если её нет или она
+// закончилась, VMA сам откатится на обычную host-visible память. Писать только последовательно, не читать.
+enum class MemUsage { GpuOnly, Upload, Readback, Stream };
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;

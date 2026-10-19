@@ -1,5 +1,6 @@
 #include "UniX/Scheduler.h"
 #include "Core.h"
+#include "Profile.h"
 
 #include <algorithm>
 #include <chrono>
@@ -68,6 +69,50 @@ TaskRecord::~TaskRecord() {
     }
 }
 
+// ---------------- Кольца work stealing ----------------
+
+void Scheduler::Ring::Grow() {
+    const uint32_t oldCap = static_cast<uint32_t>(buf.size());
+    const uint32_t cap = oldCap == 0 ? 64u : oldCap * 2;
+    std::vector<Job> grown(cap);
+    for (uint32_t i = 0; i < size; ++i)
+        grown[i] = buf[(head + i) & (oldCap - 1)];
+    buf.swap(grown);
+    head = 0;
+}
+
+void Scheduler::Ring::PushBack(const Job& job) {
+    std::lock_guard lk(mutex);
+    if (size == buf.size())
+        Grow();
+    buf[(head + size) & (buf.size() - 1)] = job;
+    ++size;
+    approxSize.store(size, std::memory_order_release);
+}
+
+void Scheduler::Ring::PushFront(const Job& job) {
+    std::lock_guard lk(mutex);
+    if (size == buf.size())
+        Grow();
+    head = (head + static_cast<uint32_t>(buf.size()) - 1) & (static_cast<uint32_t>(buf.size()) - 1);
+    buf[head] = job;
+    ++size;
+    approxSize.store(size, std::memory_order_release);
+}
+
+bool Scheduler::Ring::PopFront(Job& out) {
+    if (approxSize.load(std::memory_order_acquire) == 0)
+        return false;  // пустое кольцо не блокируем
+    std::lock_guard lk(mutex);
+    if (size == 0)
+        return false;
+    out = buf[head];
+    head = (head + 1) & (static_cast<uint32_t>(buf.size()) - 1);
+    --size;
+    approxSize.store(size, std::memory_order_release);
+    return true;
+}
+
 // ---------------- Scheduler ----------------
 
 uint32_t Scheduler::ResolveWorkerCount(uint32_t requested) {
@@ -82,14 +127,16 @@ int Scheduler::ThreadSlot() { return t_slot; }
 Scheduler::Scheduler(uint32_t workerThreads, float targetFps)
     : m_workerCount(ResolveWorkerCount(workerThreads)) {
     SetTargetFps(targetFps);
+    m_queues = std::make_unique<SlotQueues[]>(ThreadSlots());
     m_workerLane = std::make_unique<std::atomic<LaneType>[]>(m_workerCount);
     m_coreWorkers = std::max(1u, m_workerCount / 3);
     for (uint32_t i = 0; i < m_workerCount; ++i)
         m_workerLane[i].store(i < m_coreWorkers ? LaneType::Core : LaneType::General);
 
+    CE_THREAD_NAME("Main");
     for (uint32_t i = 0; i < m_workerCount; ++i)
         m_threads.emplace_back([this, i] { WorkerLoop(i + 1); });
-    m_threads.emplace_back([this] { BackgroundLoop(m_workerCount + 1); });
+    m_threads.emplace_back([this] { BackgroundLoop(BackgroundSlot()); });
 
     Log("UniX: workers=" + std::to_string(m_workerCount) + " (core=" + std::to_string(m_coreWorkers) +
         ", general=" + std::to_string(m_workerCount - m_coreWorkers) + ") + background=1 + main");
@@ -156,7 +203,23 @@ void Scheduler::BeginFrame(double time, float dt, uint64_t frame) {
     m_pending.clear();
 }
 
+namespace {
+// Склейка мелких задач: задача считается мелкой, если по факту дешевле kSmallTaskMs
+// (или ещё не измерена, но заявлена как Low). Джоб набирается до kBatchMs оценки или kMaxBatch задач.
+constexpr float kSmallTaskMs = 0.05f;
+constexpr float kBatchMs = 0.1f;
+constexpr size_t kMaxBatch = 64;
+
+bool IsSmall(const TaskRecord& r) {
+    if (r.pinMain || r.effective != Cost::Low)
+        return false;
+    return r.emaMs < 0 ? r.declared == Cost::Low : r.emaMs < kSmallTaskMs;
+}
+float EstimateMs(const TaskRecord& r) { return r.emaMs < 0 ? 0.01f : r.emaMs; }
+} // namespace
+
 void Scheduler::RunStage(Stage stage) {
+    CE_ZONE("UniX.RunStage");
     auto& list = m_tasks[static_cast<size_t>(stage)];
     m_due.clear();
     for (auto& sp : list) {
@@ -186,22 +249,57 @@ void Scheduler::RunStage(Stage stage) {
     int64_t t0 = NowNs();
     m_inStage.store(true, std::memory_order_release);
 
+    // Джобы раздаются по кольцам main + воркеров по кругу: самые тяжёлые попадают к разным потокам,
+    // свободные потоки докрадывают остальное.
     std::atomic<int32_t> counter{0};
-    int32_t pooled = 0;
-    for (TaskRecord* r : m_due) {
-        if (r->pinMain)
+    const uint32_t execSlots = m_workerCount + 1;
+    uint32_t next = 1 % execSlots;
+    uint32_t pushed = 0;
+    auto submit = [&](const Job& job, int bucket) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+        PushTo(next, bucket, job, false);
+        next = (next + 1) % execSlots;
+        ++pushed;
+    };
+
+    size_t i = 0;
+    while (i < m_due.size()) {
+        TaskRecord* r = m_due[i];
+        if (r->pinMain) {
+            ++i;
             continue;
+        }
         Job job;
-        job.run = RunTaskJob;
         job.data = this;
         job.counter = &counter;
+        const int bucket = static_cast<int>(r->sig);
+        if (IsSmall(*r)) {
+            size_t j = i;
+            float est = 0;
+            while (j < m_due.size() && j - i < kMaxBatch) {
+                const TaskRecord* q = m_due[j];
+                if (q->sig != r->sig || !IsSmall(*q))
+                    break;
+                est += EstimateMs(*q);
+                ++j;
+                if (est >= kBatchMs)
+                    break;
+            }
+            if (j - i > 1) {
+                job.run = RunBatchJob;
+                job.begin = static_cast<uint32_t>(i);
+                job.end = static_cast<uint32_t>(j);
+                submit(job, bucket);
+                i = j;
+                continue;
+            }
+        }
+        job.run = RunTaskJob;
         job.rec = r;
-        ++pooled;
-        counter.fetch_add(1, std::memory_order_relaxed);
-        Push(static_cast<int>(r->sig), job, false);
+        submit(job, bucket);
+        ++i;
     }
-    if (pooled > 0)
-        Notify();
+    Notify(pushed);
 
     for (TaskRecord* r : m_due)
         if (r->pinMain)
@@ -214,6 +312,7 @@ void Scheduler::RunStage(Stage stage) {
 }
 
 void Scheduler::ExecuteTask(TaskRecord& rec) {
+    CE_ZONE_NAMED(rec.name.c_str(), rec.name.size());
     rec.arena.Reset();
     rec.waitNs = 0;
     rec.chunkNs.store(0, std::memory_order_relaxed);
@@ -237,6 +336,13 @@ void Scheduler::ExecuteTask(TaskRecord& rec) {
 
 void Scheduler::RunTaskJob(Job& job) { static_cast<Scheduler*>(job.data)->ExecuteTask(*job.rec); }
 
+// Склеенные мелкие задачи: m_due не меняется до конца стадии, поэтому индексы стабильны
+void Scheduler::RunBatchJob(Job& job) {
+    auto* self = static_cast<Scheduler*>(job.data);
+    for (uint32_t k = job.begin; k < job.end; ++k)
+        self->ExecuteTask(*self->m_due[k]);
+}
+
 void Scheduler::RunAsyncJob(Job& job) {
     std::unique_ptr<AsyncCtx> ctx(static_cast<AsyncCtx*>(job.data));
     if (ctx->rec->alive.load() && !ctx->self->ShuttingDown())
@@ -245,6 +351,7 @@ void Scheduler::RunAsyncJob(Job& job) {
 }
 
 void Scheduler::RunChunkJob(Job& job) {
+    CE_ZONE("UniX.ParallelFor.Chunk");
     auto* d = static_cast<PForData*>(job.data);
     int64_t t0 = NowNs();
     d->fn(d->ctx, job.begin, job.end);
@@ -252,22 +359,43 @@ void Scheduler::RunChunkJob(Job& job) {
         job.rec->chunkNs.fetch_add(NowNs() - t0, std::memory_order_relaxed);
 }
 
-void Scheduler::Push(int bucket, const Job& job, bool front) {
-    {
-        std::lock_guard lk(m_buckets[bucket].mutex);
-        if (front)
-            m_buckets[bucket].jobs.push_front(job);
-        else
-            m_buckets[bucket].jobs.push_back(job);
-    }
-    m_pendingJobs.fetch_add(1, std::memory_order_release);
+// Счётчик уровня увеличивается ДО вставки: он может быть больше фактического числа джобов,
+// но никогда меньше — спящий воркер не пропустит работу.
+void Scheduler::PushTo(uint32_t slot, int bucket, const Job& job, bool front) {
+    m_bucketPending[bucket].fetch_add(1, std::memory_order_seq_cst);
+    Ring& ring = m_queues[slot].rings[bucket];
+    if (front)
+        ring.PushFront(job);
+    else
+        ring.PushBack(job);
 }
 
-void Scheduler::Notify() {
+bool Scheduler::PopFrom(uint32_t slot, int bucket, Job& out) {
+    if (!m_queues[slot].rings[bucket].PopFront(out))
+        return false;
+    m_bucketPending[bucket].fetch_sub(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool Scheduler::AnyPending() const {
+    for (const auto& p : m_bucketPending)
+        if (p.load(std::memory_order_seq_cst) > 0)
+            return true;
+    return false;
+}
+
+// Будим ровно столько воркеров, сколько появилось работы; если никто не спит — мьютекс не трогаем.
+void Scheduler::Notify(uint32_t jobs) {
+    if (jobs == 0 || m_sleepers.load(std::memory_order_seq_cst) == 0)
+        return;
     {
         std::lock_guard lk(m_sleepMutex);
     }
-    m_sleepCv.notify_all();
+    if (jobs >= m_workerCount)
+        m_sleepCv.notify_all();
+    else
+        for (uint32_t i = 0; i < jobs; ++i)
+            m_sleepCv.notify_one();
 }
 
 void Scheduler::RunJob(Job& job, int bucket) {
@@ -278,24 +406,35 @@ void Scheduler::RunJob(Job& job, int bucket) {
         job.counter->fetch_sub(1, std::memory_order_acq_rel);
 }
 
-bool Scheduler::TryRunOne(LaneType lane, int maxBucket) {
+// Уровни обходятся в порядке типа потока. На каждом уровне: своё кольцо -> чужие кольца ->
+// кольцо фонового потока (его куски не обгоняют кадровую работу).
+bool Scheduler::TryRunOne(int slotIndex, LaneType lane, int maxBucket) {
     const int* order = kBucketOrder[lane == LaneType::Core ? 0 : 1];
+    const uint32_t slot = static_cast<uint32_t>(slotIndex);
+    const uint32_t slots = ThreadSlots();
+    const uint32_t bg = BackgroundSlot();
     for (int i = 0; i < 4; ++i) {
-        int b = order[i];
-        if (b > maxBucket)
+        const int b = order[i];
+        if (b > maxBucket || m_bucketPending[b].load(std::memory_order_relaxed) <= 0)
             continue;
-        JobQueue& q = m_buckets[b];
         Job job;
-        {
-            std::lock_guard lk(q.mutex);
-            if (q.jobs.empty())
-                continue;
-            job = q.jobs.front();
-            q.jobs.pop_front();
+        if (PopFrom(slot, b, job)) {
+            RunJob(job, b);
+            return true;
         }
-        m_pendingJobs.fetch_sub(1, std::memory_order_acq_rel);
-        RunJob(job, b);
-        return true;
+        for (uint32_t k = 1; k < slots; ++k) {
+            const uint32_t victim = (slot + k) % slots;
+            if (victim == bg)
+                continue;
+            if (PopFrom(victim, b, job)) {
+                RunJob(job, b);
+                return true;
+            }
+        }
+        if (slot != bg && PopFrom(bg, b, job)) {
+            RunJob(job, b);
+            return true;
+        }
     }
     return false;
 }
@@ -311,32 +450,36 @@ LaneType Scheduler::CurrentLane() const {
 // Пока ждём — помогаем. maxBucket не даёт взять работу менее значимого уровня: например,
 // ожидающий шаг Grave (держит свой лок) не подхватит пользовательский кусок, который зовёт Raycast.
 void Scheduler::WaitAndHelp(std::atomic<int32_t>& counter, int maxBucket) {
-    LaneType lane = CurrentLane();
+    const LaneType lane = CurrentLane();
     while (counter.load(std::memory_order_acquire) > 0)
-        if (!TryRunOne(lane, maxBucket))
+        if (!TryRunOne(t_slot, lane, maxBucket))
             std::this_thread::yield();
 }
 
 void Scheduler::WorkerLoop(uint32_t slot) {
     t_slot = static_cast<int>(slot);
+    CE_THREAD_NAME(("UniX worker " + std::to_string(slot)).c_str());
     while (!m_stop.load(std::memory_order_acquire)) {
         LaneType lane = m_workerLane[slot - 1].load(std::memory_order_relaxed);
-        if (TryRunOne(lane))
+        if (TryRunOne(t_slot, lane))
             continue;
         bool got = false;
         for (int i = 0; i < 64 && !got; ++i) {
             std::this_thread::yield();
-            got = TryRunOne(lane);
+            got = TryRunOne(t_slot, lane);
         }
         if (got)
             continue;
         std::unique_lock lk(m_sleepMutex);
-        m_sleepCv.wait(lk, [&] { return m_stop.load() || m_pendingJobs.load(std::memory_order_acquire) > 0; });
+        m_sleepers.fetch_add(1, std::memory_order_seq_cst);
+        m_sleepCv.wait(lk, [&] { return m_stop.load() || AnyPending(); });
+        m_sleepers.fetch_sub(1, std::memory_order_seq_cst);
     }
 }
 
 void Scheduler::BackgroundLoop(uint32_t slot) {
     t_slot = static_cast<int>(slot);
+    CE_THREAD_NAME("UniX background");
     while (true) {
         Job job;
         {
@@ -381,7 +524,8 @@ void Scheduler::ParallelFor(TaskRecord* rec, uint32_t count, void (*fn)(void*, u
     PForData data{fn, ctx};
     std::atomic<int32_t> counter{static_cast<int32_t>(chunks - 1)};
     const int bucket = rec ? static_cast<int>(rec->sig) : 3;
-    const bool front = !(rec && rec->async);  // фоновые куски не обгоняют кадровую работу
+    const bool async = rec && rec->async;
+    const uint32_t self = static_cast<uint32_t>(t_slot);
     for (uint32_t i = chunks - 1; i >= 1; --i) {
         Job job;
         job.run = RunChunkJob;
@@ -390,9 +534,12 @@ void Scheduler::ParallelFor(TaskRecord* rec, uint32_t count, void (*fn)(void*, u
         job.end = static_cast<uint32_t>(uint64_t(count) * (i + 1) / chunks);
         job.counter = &counter;
         job.rec = rec;
-        Push(bucket, job, front);
+        if (async)
+            PushTo(BackgroundSlot(), bucket, job, false);  // фоновые куски не обгоняют кадровую работу
+        else
+            PushTo((self + i) % lanes, bucket, job, true);  // куски — вперёд очереди, по разным потокам
     }
-    Notify();
+    Notify(chunks - 1);
 
     fn(ctx, 0, static_cast<uint32_t>(uint64_t(count) / chunks));
 

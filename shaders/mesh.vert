@@ -10,10 +10,11 @@ layout(location = 1) out vec3 vNormal;
 layout(location = 2) flat out uint vInstance;
 
 void main() {
-    Instance inst = instances[gl_InstanceIndex];
+    uint idx = drawIndices[gl_InstanceIndex];
+    Instance inst = instances[idx];
     vec4 wp = inst.model * vec4(inPos, 1.0);
     vWorldPos = wp.xyz;
     vNormal = mat3(inst.model) * (inNormal * inst.invScale2.xyz);  // M * S^-2 = нормальная матрица для TRS
-    vInstance = gl_InstanceIndex;
+    vInstance = idx;
     gl_Position = frame.viewProj * wp;
 }

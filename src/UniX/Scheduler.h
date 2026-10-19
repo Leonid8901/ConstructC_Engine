@@ -11,6 +11,12 @@
 //   Background — фоновый поток для одноразовых Extreme-задач, растянутых на несколько кадров.
 // Соотношение Core/General UniX пересчитывает по фактической нагрузке.
 //
+// Очереди: у каждого потока (main, воркеры, фон) своё кольцо работы на каждый уровень значимости.
+// Поток сначала берёт работу из своего кольца, затем крадёт из чужих (work stealing). Порядок
+// обхода уровней задаёт тип потока (Core/General), так что предпочтения лейнов сохраняются.
+// Мелкие задачи одной значимости склеиваются в один джоб, чтобы не платить накладные расходы
+// на каждую.
+//
 // Задача «перекидывается» только между вызовами — это безопасная точка: её состояние живёт
 // в TaskRecord, а не в потоке, поэтому следующий тик может уйти в другой лейн.
 #include "CE/UniX.h"
@@ -134,23 +140,55 @@ private:
         std::deque<Job> jobs;
     };
 
+    // Кольцевой буфер джобов одного потока для одного уровня значимости.
+    // approxSize читается без блокировки, чтобы при краже не трогать мьютекс пустых колец.
+    // alignas(64): соседние кольца не делят строку кэша (MSVC предупреждает о выравнивании — это и нужно).
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+    struct alignas(64) Ring {
+        std::mutex mutex;
+        std::vector<Job> buf;  // ёмкость — степень двойки
+        uint32_t head = 0;
+        uint32_t size = 0;
+        std::atomic<uint32_t> approxSize{0};
+
+        void PushBack(const Job& job);
+        void PushFront(const Job& job);
+        bool PopFront(Job& out);
+
+    private:
+        void Grow();
+    };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    struct SlotQueues {
+        std::array<Ring, 4> rings;  // Sys, Engine, Actor, Task
+    };
+
     struct AsyncCtx {
         Scheduler* self;
         std::shared_ptr<TaskRecord> rec;
     };
     static void RunTaskJob(Job& job);
+    static void RunBatchJob(Job& job);
     static void RunAsyncJob(Job& job);
     static void RunChunkJob(Job& job);
 
     void ExecuteTask(TaskRecord& rec);
     void WorkerLoop(uint32_t slot);
     void BackgroundLoop(uint32_t slot);
-    bool TryRunOne(LaneType lane, int maxBucket = 3);
+    bool TryRunOne(int slot, LaneType lane, int maxBucket = 3);
+    bool PopFrom(uint32_t slot, int bucket, Job& out);
     void RunJob(Job& job, int bucket);
-    void Push(int bucket, const Job& job, bool front);
-    void Notify();
+    void PushTo(uint32_t slot, int bucket, const Job& job, bool front);
+    void Notify(uint32_t jobs);
+    bool AnyPending() const;
     void WaitAndHelp(std::atomic<int32_t>& counter, int maxBucket);
     LaneType CurrentLane() const;
+    uint32_t BackgroundSlot() const { return m_workerCount + 1; }
 
     void UpdateStats(TaskRecord& rec);
     void Rebalance();
@@ -162,9 +200,10 @@ private:
     std::unique_ptr<std::atomic<LaneType>[]> m_workerLane;
     uint32_t m_coreWorkers = 1;
 
-    std::array<JobQueue, 4> m_buckets;   // по значимости: Sys, Engine, Actor, Task
-    JobQueue m_background;
-    std::atomic<int32_t> m_pendingJobs{0};
+    std::unique_ptr<SlotQueues[]> m_queues;  // по одному набору колец на поток (ThreadSlots())
+    std::array<std::atomic<int32_t>, 4> m_bucketPending{};  // джобов в кольцах по уровням (с запасом вверх)
+    JobQueue m_background;  // фоновые Once-задачи целиком
+    std::atomic<uint32_t> m_sleepers{0};
     std::mutex m_sleepMutex;
     std::condition_variable m_sleepCv;
     std::mutex m_bgMutex;

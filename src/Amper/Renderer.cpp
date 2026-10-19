@@ -1,5 +1,6 @@
 #include "Amper/Renderer.h"
 #include "Core.h"
+#include "Profile.h"
 #include "Platform/Window.h"
 #include "UniX/GpuLanes.h"
 #include "UniX/Scheduler.h"
@@ -105,6 +106,7 @@ Renderer::~Renderer() {
         vkDestroyFence(m_device, f.fence, nullptr);
         m_gpu.Destroy(f.ubo);
         m_gpu.Destroy(f.instances);
+        m_gpu.Destroy(f.drawIndices);
         m_gpu.Destroy(f.lights);
         if (f.tlas)
             m_gpu.Rt().destroyAs(m_device, f.tlas, nullptr);
@@ -177,6 +179,7 @@ void Renderer::CreateDescriptors() {
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
     bindings.push_back({4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+    bindings.push_back({5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});  // drawIndices
     if (m_rtSupported)
         bindings.push_back({3, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
 
@@ -187,7 +190,7 @@ void Renderer::CreateDescriptors() {
 
     std::vector<VkDescriptorPoolSize> sizes = {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kFramesInFlight},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kFramesInFlight},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight},
     };
     if (m_rtSupported)
@@ -217,8 +220,8 @@ void Renderer::CreateFrames() {
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         VK_CHECK(vkCreateFence(m_device, &fi, nullptr, &f.fence));
 
-        f.ubo = m_gpu.CreateBuffer(sizeof(FrameUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, MemUsage::Upload);
-        f.lights = m_gpu.CreateBuffer(sizeof(GpuLight) * kMaxLights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemUsage::Upload);
+        f.ubo = m_gpu.CreateBuffer(sizeof(FrameUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, MemUsage::Stream);
+        f.lights = m_gpu.CreateBuffer(sizeof(GpuLight) * kMaxLights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemUsage::Stream);
 
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = m_descriptorPool;
@@ -227,6 +230,7 @@ void Renderer::CreateFrames() {
         VK_CHECK(vkAllocateDescriptorSets(m_device, &dai, &f.set));
 
         EnsureInstanceCapacity(f, 1024);
+        EnsureDrawIndexCapacity(f, 1024 * (1 + kCascades));
         WriteDescriptor(f, 0);
         WriteDescriptor(f, 2);
         WriteDescriptor(f, 4);
@@ -247,6 +251,7 @@ void Renderer::WriteDescriptor(Frame& f, uint32_t binding) {
     case 0: bi = {f.ubo.buffer, 0, VK_WHOLE_SIZE}; w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w.pBufferInfo = &bi; break;
     case 1: bi = {f.instances.buffer, 0, VK_WHOLE_SIZE}; w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi; break;
     case 2: bi = {f.lights.buffer, 0, VK_WHOLE_SIZE}; w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi; break;
+    case 5: bi = {f.drawIndices.buffer, 0, VK_WHOLE_SIZE}; w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi; break;
     case 3:
         as.accelerationStructureCount = 1;
         as.pAccelerationStructures = &f.tlas;
@@ -268,9 +273,21 @@ void Renderer::EnsureInstanceCapacity(Frame& f, uint32_t count) {
     while (cap < count)
         cap *= 2;
     m_gpu.Destroy(f.instances);
-    f.instances = m_gpu.CreateBuffer(sizeof(GpuInstance) * cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemUsage::Upload);
+    f.instances = m_gpu.CreateBuffer(sizeof(GpuInstance) * cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemUsage::Stream);
     f.instanceCapacity = cap;
     WriteDescriptor(f, 1);
+}
+
+void Renderer::EnsureDrawIndexCapacity(Frame& f, uint32_t count) {
+    if (count <= f.drawIndexCapacity)
+        return;
+    uint32_t cap = std::max(f.drawIndexCapacity, 1024u);
+    while (cap < count)
+        cap *= 2;
+    m_gpu.Destroy(f.drawIndices);
+    f.drawIndices = m_gpu.CreateBuffer(sizeof(uint32_t) * cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemUsage::Stream);
+    f.drawIndexCapacity = cap;
+    WriteDescriptor(f, 5);
 }
 
 void Renderer::EnsureTlasCapacity(Frame& f, uint32_t count) {
@@ -289,7 +306,7 @@ void Renderer::EnsureTlasCapacity(Frame& f, uint32_t count) {
     f.tlasInstances = m_gpu.CreateBuffer(sizeof(VkAccelerationStructureInstanceKHR) * cap,
                                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                         MemUsage::Upload, false, 16);
+                                         MemUsage::Stream, false, 16);
 
     VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
     geom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
@@ -470,8 +487,8 @@ void Renderer::SetShadowDistance(float d) {
 // Каскады: «практическое» разбиение (смесь логарифмического и линейного), на каждый каскад —
 // ограничивающая сфера среза фрустума (размер не зависит от поворота камеры) и привязка к сетке
 // текселей (тени не «мерцают» при движении).
-void Renderer::ComputeCascades(FrameUbo& ubo, Vec3 camPos, Vec3 fwd, Vec3 right, Vec3 up, float tanHalf, float aspect,
-                               Vec3 sunDir, float distance) {
+void Renderer::ComputeCascades(FrameUbo& ubo, ShadowCull& cull, Vec3 camPos, Vec3 fwd, Vec3 right, Vec3 up,
+                               float tanHalf, float aspect, Vec3 sunDir, float distance) {
     constexpr float kNear = 0.05f, kLambda = 0.75f;
     float splits[kCascades + 1];
     splits[0] = kNear;
@@ -483,6 +500,7 @@ void Renderer::ComputeCascades(FrameUbo& ubo, Vec3 camPos, Vec3 fwd, Vec3 right,
     Vec3 L = Normalize(sunDir);
     Vec3 upL = std::fabs(L.y) > 0.99f ? Vec3{0, 0, 1} : Vec3{0, 1, 0};
     Mat4 lightRot = Mat4::LookAt({0, 0, 0}, L, upL);
+    cull.lightView = lightRot;
 
     for (uint32_t c = 0; c < kCascades; ++c) {
         Vec3 corners[8];
@@ -512,6 +530,8 @@ void Renderer::ComputeCascades(FrameUbo& ubo, Vec3 camPos, Vec3 fwd, Vec3 right,
         ubo.cascadeViewProj[c] = ortho * lightRot;
         ubo.cascadeSplits[c] = splits[c + 1];
         ubo.cascadeTexel[c] = texel;
+        // Для отсечения: запас в 4 текселя покрывает normal offset и PCF на краю каскада
+        cull.box[c] = {cl.x, cl.y, r + 4.0f * texel, -cl.z + r};
     }
 }
 
@@ -541,7 +561,7 @@ void Renderer::RecordShadowPass(Frame& f) {
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_shadowPipeline);
         vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(uint32_t), &c);
-        for (const Draw& d : f.draws) {
+        for (const Draw& d : f.shadowDraws[c]) {  // только то, что попадает в объём каскада
             const MeshGpu* mesh = m_meshes->Get(d.mesh);
             VkDeviceSize offset = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertices.buffer, &offset);
@@ -600,6 +620,7 @@ uint32_t Renderer::LightCount() {
 // ---------------- Prepare (воркеры) ----------------
 
 void Renderer::Prepare(Task& task) {
+    CE_ZONE("Amper.Prepare");
     Frame& f = m_frames[m_frameIndex];
     int64_t w0 = NowNs();
     VK_CHECK(vkWaitForFences(m_device, 1, &f.fence, VK_TRUE, UINT64_MAX));
@@ -622,51 +643,20 @@ void Renderer::Prepare(Task& task) {
     }
     m_meshOffsets.resize(meshCount);
     uint32_t total = 0;
-    f.draws.clear();
     for (uint32_t m = 0; m < meshCount; ++m) {
         m_meshOffsets[m] = total;
-        if (m_meshCounts[m] > 0)
-            f.draws.push_back({m, total, m_meshCounts[m]});
         total += m_meshCounts[m];
     }
 
     f.rt = m_rtEnabled.load() && m_rtSupported;
     f.shadows = !f.rt && m_shadowsEnabled.load();  // при RT тени даёт ray query, карты не нужны
     EnsureInstanceCapacity(f, std::max(total, 1u));
+    EnsureDrawIndexCapacity(f, std::max(total, 1u) * (1 + kCascades));
     if (f.rt)
         EnsureTlasCapacity(f, std::max(total, 1u));
     f.tlasCount = f.rt ? total : 0;
 
-    // 2. Матрицы и TLAS-инстансы (параллельно)
-    auto* instances = static_cast<GpuInstance*>(f.instances.mapped);
-    auto* tlas = f.rt ? static_cast<VkAccelerationStructureInstanceKHR*>(f.tlasInstances.mapped) : nullptr;
-    task.ParallelFor(cap, [&](uint32_t begin, uint32_t end) {
-        for (uint32_t i = begin; i < end; ++i) {
-            if (m_slot[i] == UINT32_MAX)
-                continue;
-            const EntityData& d = world.At(i);
-            const uint32_t idx = m_meshOffsets[d.mesh] + m_slot[i];
-            GpuInstance& g = instances[idx];
-            Mat4 model = Mat4::TRS(d.pos, d.rot, d.scale);
-            std::memcpy(g.model, model.m, sizeof(g.model));
-            g.invScale2 = {1.0f / (d.scale.x * d.scale.x), 1.0f / (d.scale.y * d.scale.y), 1.0f / (d.scale.z * d.scale.z), 0};
-            g.colorRough = {d.material.color, d.material.roughness};
-            g.emissiveMetal = {d.material.emissive, d.material.metallic};
-            if (tlas) {
-                VkAccelerationStructureInstanceKHR& ti = tlas[idx];
-                for (int r = 0; r < 3; ++r)
-                    for (int c = 0; c < 4; ++c)
-                        ti.transform.matrix[r][c] = model.m[c * 4 + r];
-                ti.instanceCustomIndex = 0;
-                ti.mask = 0xFF;
-                ti.instanceShaderBindingTableRecordOffset = 0;
-                ti.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-                ti.accelerationStructureReference = m_meshes->Get(d.mesh)->blasAddress;
-            }
-        }
-    });
-
-    // 3. Камера, свет
+    // 2. Камера, свет, каскады — до инстансов, потому что по ним идёт отсечение
     Vec3 camPos;
     float yaw, pitch, fov;
     {
@@ -682,11 +672,14 @@ void Renderer::Prepare(Task& task) {
     Vec3 up = Cross(right, fwd);
     VkExtent2D ext = m_swapchain->Extent();
     float aspect = static_cast<float>(ext.width) / static_cast<float>(std::max(ext.height, 1u));
+    const float tanV = std::tan(fov * 0.5f);
+    const float tanH = tanV * aspect;
 
     FrameUbo ubo{};
+    ShadowCull cull{};
     ubo.viewProj = Mat4::PerspectiveReverseZ(fov, aspect, 0.05f) * Mat4::LookAt(camPos, camPos + fwd, {0, 1, 0});
     ubo.camPos = {camPos, static_cast<float>(Core().time)};
-    ubo.camForward = {fwd, std::tan(fov * 0.5f)};
+    ubo.camForward = {fwd, tanV};
     ubo.camRight = {right, aspect};
     ubo.camUp = {up, 0};
     {
@@ -697,7 +690,7 @@ void Renderer::Prepare(Task& task) {
         ubo.skyZenith = {m_skyZenith, 0};
         ubo.skyHorizon = {m_skyHorizon, 0};
         if (f.shadows)
-            ComputeCascades(ubo, camPos, fwd, right, up, std::tan(fov * 0.5f), aspect, m_sunDir, m_shadowDistance);
+            ComputeCascades(ubo, cull, camPos, fwd, right, up, tanV, aspect, m_sunDir, m_shadowDistance);
         ubo.shadowParams = {f.shadows ? 1.0f : 0.0f, 0, 0, 0};
         auto* lights = static_cast<GpuLight*>(f.lights.mapped);
         uint32_t n = 0;
@@ -709,8 +702,111 @@ void Renderer::Prepare(Task& task) {
     ubo.rtEnabled = f.rt ? 1 : 0;
     std::memcpy(f.ubo.mapped, &ubo, sizeof(ubo));
 
+    // Плоскости фрустума камеры (нормали внутрь, дальней нет — reverse-Z до бесконечности)
+    auto plane = [&](Vec3 n) {
+        n = Normalize(n);
+        return Vec4{n, -Dot(n, camPos)};
+    };
+    const std::array<Vec4, 5> planes = {
+        Vec4{fwd, -Dot(fwd, camPos) - 0.05f},
+        plane(fwd * tanH - right), plane(fwd * tanH + right),
+        plane(fwd * tanV - up), plane(fwd * tanV + up),
+    };
+    const bool shadows = f.shadows;
+    m_visMask.resize(std::max(total, 1u));
+
+    // 3. Матрицы, TLAS-инстансы и отсечение (параллельно).
+    // Буферы лежат в видеопамяти с доступом CPU (write-combined): структуру собираем на стеке и
+    // копируем целиком, чтобы не читать из этой памяти (битовые поля TLAS-инстанса читают слово).
+    auto* instances = static_cast<GpuInstance*>(f.instances.mapped);
+    auto* tlas = f.rt ? static_cast<VkAccelerationStructureInstanceKHR*>(f.tlasInstances.mapped) : nullptr;
+    task.ParallelFor(cap, [&](uint32_t begin, uint32_t end) {
+        for (uint32_t i = begin; i < end; ++i) {
+            if (m_slot[i] == UINT32_MAX)
+                continue;
+            const EntityData& d = world.At(i);
+            const MeshGpu* mesh = m_meshes->Get(d.mesh);
+            const uint32_t idx = m_meshOffsets[d.mesh] + m_slot[i];
+            const Mat4 model = Mat4::TRS(d.pos, d.rot, d.scale);
+
+            GpuInstance g;
+            std::memcpy(g.model, model.m, sizeof(g.model));
+            g.invScale2 = {1.0f / (d.scale.x * d.scale.x), 1.0f / (d.scale.y * d.scale.y), 1.0f / (d.scale.z * d.scale.z), 0};
+            g.colorRough = {d.material.color, d.material.roughness};
+            g.emissiveMetal = {d.material.emissive, d.material.metallic};
+            std::memcpy(&instances[idx], &g, sizeof(g));
+
+            if (tlas) {
+                VkAccelerationStructureInstanceKHR ti{};
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        ti.transform.matrix[r][c] = model.m[c * 4 + r];
+                ti.instanceCustomIndex = 0;
+                ti.mask = 0xFF;
+                ti.instanceShaderBindingTableRecordOffset = 0;
+                ti.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+                ti.accelerationStructureReference = mesh->blasAddress;
+                std::memcpy(&tlas[idx], &ti, sizeof(ti));
+            }
+
+            // Ограничивающая сфера в мире
+            const Vec3 c = model.TransformPoint(mesh->boundCenter);
+            const Vec3 as = Abs(d.scale);
+            const float r = mesh->boundRadius * std::max(as.x, std::max(as.y, as.z));
+
+            uint8_t mask = 1;
+            for (const Vec4& p : planes)
+                if (p.x * c.x + p.y * c.y + p.z * c.z + p.w < -r) {
+                    mask = 0;
+                    break;
+                }
+            if (shadows) {
+                // В каскад попадает всё, что пересекает его прямоугольник по X/Y и не лежит целиком
+                // дальше его дальней границы. Ближнюю не проверяем: ближе неё работает «пэнкейкинг».
+                const Vec3 lp = cull.lightView.TransformPoint(c);
+                for (uint32_t k = 0; k < kCascades; ++k) {
+                    const Vec4& b = cull.box[k];
+                    const float lim = b.z + r;
+                    if (std::fabs(lp.x - b.x) <= lim && std::fabs(lp.y - b.y) <= lim && -lp.z - r <= b.w)
+                        mask |= static_cast<uint8_t>(1u << (k + 1));
+                }
+            }
+            m_visMask[idx] = mask;
+        }
+    });
+
+    // 4. Компактные списки индексов: по мешу — непрерывный диапазон, один draw на меш и проход
+    auto* out = static_cast<uint32_t*>(f.drawIndices.mapped);
+    uint32_t written = 0;
+    auto build = [&](uint8_t bit, std::vector<Draw>& draws) {
+        draws.clear();
+        uint32_t drawn = 0;
+        for (uint32_t m = 0; m < meshCount; ++m) {
+            const uint32_t count = m_meshCounts[m];
+            if (count == 0)
+                continue;
+            const uint32_t base = m_meshOffsets[m];
+            const uint32_t first = written;
+            for (uint32_t k = 0; k < count; ++k)
+                if (m_visMask[base + k] & bit)
+                    out[written++] = base + k;
+            if (written > first) {
+                draws.push_back({m, first, written - first});
+                drawn += written - first;
+            }
+        }
+        return drawn;
+    };
+    const uint32_t visible = build(1, f.draws);
+    for (uint32_t c = 0; c < kCascades; ++c) {
+        if (shadows)
+            build(static_cast<uint8_t>(1u << (c + 1)), f.shadowDraws[c]);
+        else
+            f.shadowDraws[c].clear();
+    }
+
     m_drawCalls.store(static_cast<uint32_t>(f.draws.size()));
-    m_instances.store(total);
+    m_instances.store(visible);
 }
 
 // ---------------- Render (главный поток) ----------------
@@ -812,6 +908,7 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
 }
 
 void Renderer::Render() {
+    CE_ZONE("Amper.Render");
     Frame& f = m_frames[m_frameIndex];
 
     uint32_t imageIndex = 0;

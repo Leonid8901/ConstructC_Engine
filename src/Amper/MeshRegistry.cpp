@@ -3,6 +3,7 @@
 #include "UniX/GpuLanes.h"
 #include "Vulkan/VkCheck.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -53,6 +54,19 @@ uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const 
                                       MemUsage::GpuOnly, true);
     mesh.vertexCount = static_cast<uint32_t>(vertexCount);
     mesh.indexCount = static_cast<uint32_t>(indexCount);
+
+    // Ограничивающая сфера в локальных координатах (центр AABB) — для отсечения в Amper
+    Vec3 lo = vertices[0].position, hi = vertices[0].position;
+    for (size_t k = 1; k < vertexCount; ++k) {
+        lo = Min(lo, vertices[k].position);
+        hi = Max(hi, vertices[k].position);
+    }
+    const Vec3 center = (lo + hi) * 0.5f;
+    float r2 = 0;
+    for (size_t k = 0; k < vertexCount; ++k)
+        r2 = std::max(r2, LengthSq(vertices[k].position - center));
+    mesh.boundCenter = center;
+    mesh.boundRadius = std::sqrt(r2);
 
     Buffer staging = m_gpu.CreateBuffer(vbSize + ibSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemUsage::Upload);
     std::memcpy(staging.mapped, vertices, vbSize);

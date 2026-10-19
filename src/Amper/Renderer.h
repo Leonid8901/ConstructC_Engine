@@ -109,8 +109,14 @@ public:
     };
 
 private:
+    // first/count — диапазон в буфере drawIndices (индексы инстансов, прошедших отсечение)
     struct Draw {
         uint32_t mesh, first, count;
+    };
+    // Объём каскада в пространстве света: центр по X/Y, полуразмер и дальняя граница по глубине
+    struct ShadowCull {
+        Mat4 lightView;
+        std::array<Vec4, 4> box{};  // (cx, cy, half, far)
     };
     struct Frame {
         VkCommandPool pool = VK_NULL_HANDLE;
@@ -124,9 +130,12 @@ private:
         VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
         uint32_t tlasCapacity = 0;
         uint32_t tlasCount = 0;
+        Buffer drawIndices;  // [камера | каскад 0 | … | каскад 3], uint32 индексы инстансов
+        uint32_t drawIndexCapacity = 0;
         bool rt = false;
         bool shadows = false;
-        std::vector<Draw> draws;
+        std::vector<Draw> draws;                                // основной проход
+        std::array<std::vector<Draw>, kCascades> shadowDraws;  // проходы каскадов
     };
 
     void CreateFrames();
@@ -134,12 +143,13 @@ private:
     void CreatePipelines();
     void CreateDepth();
     void CreateShadowResources();
-    void ComputeCascades(FrameUbo& ubo, Vec3 camPos, Vec3 fwd, Vec3 right, Vec3 up, float tanHalf, float aspect,
-                         Vec3 sunDir, float distance);
+    void ComputeCascades(FrameUbo& ubo, ShadowCull& cull, Vec3 camPos, Vec3 fwd, Vec3 right, Vec3 up, float tanHalf,
+                         float aspect, Vec3 sunDir, float distance);
     void RecordShadowPass(Frame& f);
     void CreateRenderFinished();
     void DestroyRenderFinished();
     void EnsureInstanceCapacity(Frame& f, uint32_t count);
+    void EnsureDrawIndexCapacity(Frame& f, uint32_t count);
     void EnsureTlasCapacity(Frame& f, uint32_t count);
     void WriteDescriptor(Frame& f, uint32_t binding);
     void HandleResize();
@@ -195,6 +205,7 @@ private:
     std::vector<uint32_t> m_slot;
     std::vector<uint32_t> m_meshCounts;
     std::vector<uint32_t> m_meshOffsets;
+    std::vector<uint8_t> m_visMask;  // по инстансам: бит 0 — камера, биты 1..4 — каскады
 
     std::atomic<uint32_t> m_drawCalls{0};
     std::atomic<uint32_t> m_instances{0};
