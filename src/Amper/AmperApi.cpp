@@ -2,6 +2,7 @@
 #include "Amper/Renderer.h"
 #include "Core.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ce {
@@ -66,6 +67,35 @@ Light& Light::SetCastShadows(bool on) {
 }
 void Light::Remove() { R().RemoveLight(m_index, m_gen); }
 
+// ---------------- Texture / Model ----------------
+
+Texture Texture::Load(const std::string& path, bool srgb) {
+    return core::Access::MakeTexture(R().Textures().Load(path, srgb));
+}
+
+Texture Texture::Create(const uint8_t* rgba8, uint32_t width, uint32_t height, bool srgb) {
+    return core::Access::MakeTexture(R().Textures().Create(rgba8, width, height, srgb));
+}
+
+Model Model::Load(const std::string& path) { return core::Access::MakeModel(R().Models().Load(path)); }
+
+namespace {
+const core::ModelData* ModelOf(uint32_t id) { return id == UINT32_MAX ? nullptr : R().Models().Get(id); }
+} // namespace
+
+uint32_t Model::PartCount() const {
+    const auto* m = ModelOf(m_id);
+    return m ? static_cast<uint32_t>(m->parts.size()) : 0;
+}
+Vec3 Model::BoundsMin() const {
+    const auto* m = ModelOf(m_id);
+    return m ? m->boundsMin : Vec3{};
+}
+Vec3 Model::BoundsMax() const {
+    const auto* m = ModelOf(m_id);
+    return m ? m->boundsMax : Vec3{};
+}
+
 // ---------------- Mesh ----------------
 
 Mesh Mesh::Cube() {
@@ -93,7 +123,18 @@ Mesh Mesh::Capsule(float radius, float halfHeight, uint32_t segments) {
 }
 
 Mesh Mesh::Create(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices) {
-    return core::Access::MakeMesh(R().Meshes().Create(vertices.data(), vertices.size(), indices.data(), indices.size()));
+    const Vec4 def{1, 0, 0, 1};
+    const bool needTangents = std::all_of(vertices.begin(), vertices.end(), [&](const Vertex& v) {
+        return v.tangent.x == def.x && v.tangent.y == def.y && v.tangent.z == def.z && v.tangent.w == def.w;
+    });
+    if (!needTangents)
+        return core::Access::MakeMesh(R().Meshes().Create(vertices.data(), vertices.size(), indices.data(), indices.size()));
+    std::vector<Vertex> v = vertices;
+    for (uint32_t i : indices)
+        if (i >= v.size())
+            throw std::invalid_argument("Mesh::Create: индекс " + std::to_string(i) + " >= числа вершин");
+    core::MeshRegistry::ComputeTangents(v, indices);
+    return core::Access::MakeMesh(R().Meshes().Create(v.data(), v.size(), indices.data(), indices.size()));
 }
 
 Mesh Mesh::LoadOBJ(const std::string& path) {

@@ -193,9 +193,9 @@ std::shared_ptr<TaskRecord> Scheduler::Create(std::string name, Cost cost, Prior
 }
 
 void Scheduler::BeginFrame(double time, float dt, uint64_t frame) {
-    m_time = time;
+    m_time.store(time, std::memory_order_relaxed);
     m_dt = dt;
-    m_frame = frame;
+    m_frame.store(frame, std::memory_order_relaxed);
     m_stageNs = 0;
     m_waitNs.store(0);
     std::lock_guard lk(m_createMutex);
@@ -234,7 +234,7 @@ void Scheduler::RunStage(Stage stage) {
         }
         r->dt = r->pendingDt + m_dt;
         r->pendingDt = 0;
-        r->lastRunFrame = m_frame;
+        r->lastRunFrame = Frame();
         m_due.push_back(r);
     }
     if (m_due.empty())
@@ -414,6 +414,18 @@ bool Scheduler::TryRunOne(int slotIndex, LaneType lane, int maxBucket) {
     const uint32_t slot = static_cast<uint32_t>(slotIndex);
     const uint32_t slots = ThreadSlots();
     const uint32_t bg = BackgroundSlot();
+    if (slot == bg) {
+        // Фоновый поток (пониженный приоритет) помогает только своим кускам ParallelFor: возьми он
+        // кадровую работу, барьер стадии ждал бы медленный поток (инверсия приоритетов)
+        for (int b = 0; b <= maxBucket && b < 4; ++b) {
+            Job job;
+            if (m_bucketPending[b].load(std::memory_order_relaxed) > 0 && PopFrom(bg, b, job)) {
+                RunJob(job, b);
+                return true;
+            }
+        }
+        return false;
+    }
     for (int i = 0; i < 4; ++i) {
         const int b = order[i];
         if (b > maxBucket || m_bucketPending[b].load(std::memory_order_relaxed) <= 0)
@@ -646,7 +658,7 @@ void Scheduler::EndFrame() {
 
     for (auto& list : m_tasks) {
         for (auto& r : list)
-            if (r->lastRunFrame == m_frame && r->alive.load())
+            if (r->lastRunFrame == Frame() && r->alive.load())
                 UpdateStats(*r);
         std::erase_if(list, [](const std::shared_ptr<TaskRecord>& r) { return !r->alive.load(); });
     }

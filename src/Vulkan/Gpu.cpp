@@ -13,8 +13,7 @@ Gpu::Gpu(const VulkanContext& ctx)
     info.device = ctx.Device();
     info.instance = ctx.Instance();
     info.vulkanApiVersion = VK_API_VERSION_1_3;
-    if (m_rtSupported)
-        info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;  // включён всегда (скиннинг, RT)
     VK_CHECK(vmaCreateAllocator(&info, &m_allocator));
 
     if (m_rtSupported) {
@@ -91,12 +90,12 @@ void Gpu::Destroy(Buffer& b) {
 }
 
 Image Gpu::CreateImage2D(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                         uint32_t layers, VkSampleCountFlagBits samples) {
+                         uint32_t layers, VkSampleCountFlagBits samples, uint32_t mips) {
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
     ii.extent = {extent.width, extent.height, 1};
-    ii.mipLevels = 1;
+    ii.mipLevels = mips;
     ii.arrayLayers = layers;
     ii.samples = samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -104,18 +103,22 @@ Image Gpu::CreateImage2D(VkExtent2D extent, VkFormat format, VkImageUsageFlags u
 
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    ai.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    // Отдельная память — только целям рендера (крупные, пересоздаются при ресайзе). Текстуры идут в общие
+    // блоки VMA: у драйверов лимит на число выделений (на Windows часто 4096)
+    if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
+        ai.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
     Image img;
     VK_CHECK(vmaCreateImage(m_allocator, &ii, &ai, &img.image, &img.alloc, nullptr));
     img.format = format;
     img.extent = extent;
+    img.mips = mips;
 
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = img.image;
     vi.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     vi.format = format;
-    vi.subresourceRange = {aspect, 0, 1, 0, layers};
+    vi.subresourceRange = {aspect, 0, mips, 0, layers};
     VK_CHECK(vkCreateImageView(m_device, &vi, nullptr, &img.view));
     return img;
 }

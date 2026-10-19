@@ -29,6 +29,6 @@ std::string Describe(const CpuInfo& cpu);
 // работали пути с кириллицей (имя пользователя), которые через std::string/ANSI ломаются.
 std::filesystem::path ExecutableDir();
 void LowerCurrentThreadPriority();  // фоновый поток: ОС охотнее отдаёт ему E-ядра / LITTLE и не мешает кадру
-void ShowFatalError(const std::string& title, const std::string& message);  // окно на Windows, stderr везде
+void ShowFatalError(const std::string& title, const std::string& message);  // окно с ошибкой на Windows (лог пишет вызывающий)
 
 } // namespace ce::core

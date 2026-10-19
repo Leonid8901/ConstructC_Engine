@@ -1,4 +1,5 @@
 // Пример игры на CustomEngine: ни Vulkan, ни glm, ни GLFW здесь не видно.
+// Запуск: Sandbox [модель.glb|.gltf] — модель встанет на пол перед стеной.
 //
 // Управление: ПКМ + мышь — обзор, WASD/QE — полёт (Shift — быстрее),
 //             ЛКМ/Space — выстрел шаром, R — ray tracing вкл/выкл,
@@ -9,6 +10,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <vector>
+
+static std::string g_modelPath;  // Sandbox путь/к/модели.glb — показать свою модель
 
 class Demo : public Game {
 public:
@@ -23,11 +28,37 @@ public:
         World.SetBounds({-45, -20, -45}, {45, 100, 45});
         World.SetOutOfBoundsAction(OutOfBounds::Destroy);
 
-        // Пол
+        // Пол: текстура-шахматка, собранная в памяти (Texture::Create), повтор каждые 2 м
+        std::vector<uint8_t> checker(64 * 64 * 4);
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                const uint8_t v = ((x / 32) + (y / 32)) % 2 ? 120 : 90;
+                uint8_t* p = &checker[(y * 64 + x) * 4];
+                p[0] = v; p[1] = static_cast<uint8_t>(v + 4); p[2] = static_cast<uint8_t>(v + 8); p[3] = 255;
+            }
+        Material floor;
+        floor.color = {1, 1, 1};
+        floor.roughness = 0.85f;
+        floor.baseColorMap = Texture::Create(checker.data(), 64, 64);
+        floor.uvScale = {0.5f, 0.5f};
         World.Spawn()
             .SetMesh(Mesh::Plane(80))
-            .SetMaterial({{0.32f, 0.34f, 0.36f}, 0.85f})
+            .SetMaterial(floor)
             .AddBody({BodyType::Static, Shape::Plane()});
+
+        // Своя модель из командной строки: ставим её на пол перед стеной
+        if (!g_modelPath.empty()) {
+            try {
+                Model m = Model::Load(g_modelPath);
+                const Vec3 lo = m.BoundsMin(), hi = m.BoundsMax();
+                const float size = std::max(hi.x - lo.x, std::max(hi.y - lo.y, hi.z - lo.z));
+                const float s = size > 0 ? 2.5f / size : 1.0f;  // вписываем в 2,5 м
+                World.Spawn().SetModel(m).SetScale(s).SetPosition({0, -lo.y * s, 4});
+                std::printf("[game] модель %s: частей %u\n", g_modelPath.c_str(), m.PartCount());
+            } catch (const std::exception& e) {
+                std::printf("[game] не удалось загрузить модель: %s\n", e.what());
+            }
+        }
 
         // Стена из кубов
         const Mesh cube = Mesh::Cube();
@@ -198,7 +229,9 @@ private:
     TaskHandle m_radar;
 };
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1)
+        g_modelPath = argv[1];
     EngineConfig config;
     config.title = "CustomEngine Sandbox";
     config.rayTracing = true;  // если GPU не умеет — останется растеризация

@@ -40,6 +40,7 @@ public:
 
     bool RayTracingSupported() const { return m_rtSupported; }
     const GpuInfo& Info() const { return m_info; }
+    bool Anisotropy() const { return m_anisotropy; }
     const VkPhysicalDeviceAccelerationStructurePropertiesKHR& AsProperties() const { return m_asProps; }
 
 private:
@@ -52,6 +53,7 @@ private:
 
     bool m_validation = false;
     bool m_rtSupported = false;
+    bool m_anisotropy = false;
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
     VkSurfaceKHR m_surface = VK_NULL_HANDLE;

@@ -77,6 +77,13 @@ Entity& Entity::SetMesh(Mesh mesh) {
     return *this;
 }
 
+Entity& Entity::SetModel(Model model) {
+    Command c = Cmd(CmdType::SetModel, *this);
+    c.u = model.Id();
+    W().Submit(c);
+    return *this;
+}
+
 Entity& Entity::SetMaterial(const Material& m) {
     Command c = Cmd(CmdType::SetMaterial, *this);
     c.material = m;

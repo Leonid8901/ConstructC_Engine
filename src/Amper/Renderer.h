@@ -4,6 +4,8 @@
 //   Render  (главный поток, Engine): TLAS build -> небо -> инстансированная отрисовка -> present.
 // Ray tracing — флаг: PBR-растеризация всегда, тени через ray query поверх, если флаг включён и GPU умеет.
 #include "Amper/MeshRegistry.h"
+#include "Amper/ModelRegistry.h"
+#include "Amper/TextureRegistry.h"
 #include "CE/Amper.h"
 #include "CE/Engine.h"
 #include "Vulkan/Gpu.h"
@@ -25,12 +27,16 @@ class VulkanContext;
 class GpuLanes;
 class Window;
 
+// Совпадает со struct Instance в shaders/common.glsl (std430, 144 байта)
 struct GpuInstance {
     float model[16];
-    Vec4 invScale2;
-    Vec4 colorRough;
-    Vec4 emissiveMetal;
+    Vec4 colorRough;     // rgb — базовый цвет, w — roughness
+    Vec4 emissiveMetal;  // rgb — свечение, w — metallic
+    uint32_t tex[4];     // baseColor, metallicRoughness, normal, emissive; UINT32_MAX — нет
+    Vec4 params;         // normalScale, alphaCutoff, occlusionStrength, индекс occlusion (биты uint)
+    Vec4 extra;          // uvScale.xy, z = двусторонний, w — резерв
 };
+static_assert(sizeof(GpuInstance) == 144, "GpuInstance должен совпадать с шейдером");
 
 struct GpuLight {
     Vec4 posRange;
@@ -71,6 +77,8 @@ public:
     Renderer& operator=(const Renderer&) = delete;
 
     MeshRegistry& Meshes() { return *m_meshes; }
+    TextureRegistry& Textures() { return *m_textures; }
+    ModelRegistry& Models() { return *m_models; }
 
     void Prepare(Task& task);
     void Render();
@@ -116,6 +124,14 @@ private:
     // first/count — диапазон в буфере drawIndices (индексы инстансов, прошедших отсечение)
     struct Draw {
         uint32_t mesh, first, count;
+        bool doubleSided;
+    };
+    // Один инстанс к отрисовке: сущность целиком (меш) или часть её модели
+    struct InstanceRef {
+        uint32_t entity;
+        uint32_t part;  // UINT32_MAX — меш сущности, иначе индекс части модели
+        uint32_t key;   // группа отрисовки: doubleSided * meshCount + mesh
+        uint32_t slot;  // номер внутри группы
     };
     // Объём каскада в пространстве света: центр по X/Y, полуразмер и дальняя граница по глубине
     struct ShadowCull {
@@ -172,6 +188,8 @@ private:
 
     std::unique_ptr<Swapchain> m_swapchain;
     std::unique_ptr<MeshRegistry> m_meshes;
+    std::unique_ptr<TextureRegistry> m_textures;
+    std::unique_ptr<ModelRegistry> m_models;
     Image m_depth;
     Image m_msaaColor;  // только при m_samples > 1: рисуем в него, resolve — в изображение swapchain
     VkFormat m_depthFormat = VK_FORMAT_D32_SFLOAT;   // D32 -> X8_D24 -> D16, что поддерживает GPU
@@ -196,6 +214,8 @@ private:
     VkPipeline m_skyPipeline = VK_NULL_HANDLE;
     VkPipeline m_meshPipeline = VK_NULL_HANDLE;
     VkPipeline m_meshRtPipeline = VK_NULL_HANDLE;
+    VkPipeline m_meshPipeline2s = VK_NULL_HANDLE;    // двусторонние материалы (без отсечения задних граней)
+    VkPipeline m_meshRtPipeline2s = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
 
     // Каскадные карты теней
@@ -220,8 +240,8 @@ private:
     std::vector<uint32_t> m_freeLights;
 
     // Переиспользуемые буферы Prepare
-    std::vector<uint32_t> m_slot;
-    std::vector<uint32_t> m_meshCounts;
+    std::vector<InstanceRef> m_refs;
+    std::vector<uint32_t> m_meshCounts;   // по группам (2 * число мешей)
     std::vector<uint32_t> m_meshOffsets;
     std::vector<uint8_t> m_visMask;  // по инстансам: бит 0 — камера, биты 1..4 — каскады
 
