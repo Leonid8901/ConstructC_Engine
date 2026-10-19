@@ -31,6 +31,13 @@ MeshRegistry::~MeshRegistry() {
 uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const uint32_t* indices, size_t indexCount) {
     if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0)
         throw std::invalid_argument("Mesh::Create: пустой меш или число индексов не кратно 3");
+    if (vertexCount > UINT32_MAX || indexCount > UINT32_MAX)
+        throw std::invalid_argument("Mesh::Create: больше 2^32 вершин/индексов");
+    // Индекс за пределами вершин — чтение чужой памяти на GPU (в лучшем случае мусор, в худшем device lost)
+    for (size_t k = 0; k < indexCount; ++k)
+        if (indices[k] >= vertexCount)
+            throw std::invalid_argument("Mesh::Create: индекс " + std::to_string(indices[k]) + " >= числа вершин " +
+                                        std::to_string(vertexCount));
 
     uint32_t id = m_count.load();
     // слот резервируется атомарно; меш станет видимым рендеру только после ready=true
@@ -83,7 +90,6 @@ uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const 
     if (m_gpu.RayTracing())
         BuildBlas(mesh);
 
-    m_newResources.store(true);
     mesh.ready.store(true, std::memory_order_release);
     return id;
 }

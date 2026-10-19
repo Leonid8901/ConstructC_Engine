@@ -112,6 +112,7 @@ Ray tracing опционален: нужны расширения `VK_KHR_accele
 ```
 UniXBench [workers] [tiny|pfor|mixed|all] [frames]
 SceneBench [side] [seconds] [rt|nort] [shadows|noshadows]
+StressTest [seconds] [workers]   # всё API вперемешку: для ASan/TSan и валидации синхронизации Vulkan
 ```
 
 ## Структура репозитория

@@ -119,8 +119,9 @@ public:
 
     bool InStage() const { return m_inStage.load(std::memory_order_acquire); }
     bool ShuttingDown() const { return m_stop.load(std::memory_order_acquire); }
-    double Time() const { return m_time; }
-    uint64_t Frame() const { return m_frame; }
+    // atomic: фоновые (async) задачи читают время/кадр, пока главный поток начинает новый кадр
+    double Time() const { return m_time.load(std::memory_order_relaxed); }
+    uint64_t Frame() const { return m_frame.load(std::memory_order_relaxed); }
     float TargetFrameMs() const { return m_targetMs.load(); }
     void SetTargetFps(float fps) { m_targetMs.store(1000.0f / (fps > 1 ? fps : 1)); }
     float FrameWorkMs() const { return m_lastWorkMs.load(); }
@@ -216,9 +217,9 @@ private:
     std::vector<TaskRecord*> m_due;
 
     std::atomic<bool> m_inStage{false};
-    double m_time = 0;
+    std::atomic<double> m_time{0};
     float m_dt = 0;
-    uint64_t m_frame = 0;
+    std::atomic<uint64_t> m_frame{0};
 
     std::atomic<float> m_targetMs{16.6667f};
     std::atomic<int64_t> m_waitNs{0};

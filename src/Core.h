@@ -37,9 +37,10 @@ struct EngineCore {
     EngineConfig config;  // итоговая: после профиля железа и engine.json
     SystemInfo system;
     std::atomic<bool> quit{false};
-    double time = 0;
-    float dt = 0;
-    uint64_t frame = 0;
+    // atomic: читаются из фоновых задач, пока главный поток начинает кадр
+    std::atomic<double> time{0};
+    std::atomic<float> dt{0};
+    std::atomic<uint64_t> frame{0};
 };
 
 EngineCore* CorePtr();
