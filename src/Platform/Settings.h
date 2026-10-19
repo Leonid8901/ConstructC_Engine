@@ -48,6 +48,9 @@ struct UserConfig {
     int msaa = -1, shadowMapSize = -1;
     float shadowDistance = -1;
     std::string windowPlatform = "auto";  // auto / x11 / wayland / win32
+    int audioEnabled = -1;
+    float audioMaster = -1;
+    float audioGroups[4] = {-1, -1, -1, -1};  // effects, music, voice, ui
 };
 
 UserConfig LoadUserConfig(const std::filesystem::path& path, bool createIfMissing);

@@ -1,10 +1,13 @@
 // Общие структуры Amper (совпадают с GpuInstance / GpuLight / FrameUbo в Renderer.h)
 struct Instance {
     mat4 model;
-    vec4 invScale2;
-    vec4 colorRough;
-    vec4 emissiveMetal;
+    vec4 colorRough;     // rgb — базовый цвет, w — roughness
+    vec4 emissiveMetal;  // rgb — свечение, w — metallic
+    uvec4 tex;           // baseColor, metallicRoughness, normal, emissive; 0xFFFFFFFF — нет
+    vec4 params;         // normalScale, alphaCutoff, occlusionStrength, индекс occlusion (floatBitsToUint)
+    vec4 extra;          // uvScale.xy, z — двусторонний
 };
+const uint NO_TEXTURE = 0xFFFFFFFFu;
 
 struct PointLight {
     vec4 posRange;

@@ -30,6 +30,7 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent2D extent{};
+    uint32_t mips = 1;
 };
 
 struct RtFunctions {
@@ -54,7 +55,8 @@ public:
     void Destroy(Buffer& b);
 
     Image CreateImage2D(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                        uint32_t layers = 1, VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
+                        uint32_t layers = 1, VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
+                        uint32_t mips = 1);
     void Destroy(Image& img);
 
     VkDevice Device() const { return m_device; }

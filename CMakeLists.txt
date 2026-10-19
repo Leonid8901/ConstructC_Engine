@@ -40,13 +40,36 @@ FetchContent_Declare(vma
     GIT_TAG v3.3.0)
 FetchContent_MakeAvailable(glfw vma)
 
+# Заголовочные библиотеки для ассетов: cgltf (glTF 2.0), stb_image (PNG/JPEG). Только скачиваем:
+# SOURCE_SUBDIR на несуществующую папку не даёт подключить их собственные CMakeLists (тесты и т.п.)
+FetchContent_Declare(cgltf
+    GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
+    GIT_TAG v1.15
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR do-not-add)
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG a7d4c2175630e1ea5b6f8dd00ab96fed0b97b96d
+    SOURCE_SUBDIR do-not-add)
+# miniaudio — звук (WASAPI/DirectSound на Windows, PulseAudio/ALSA/JACK на Linux; системные
+# аудиобиблиотеки грузятся во время работы, при сборке пакеты не нужны). Декодеры WAV/MP3/FLAC встроены.
+FetchContent_Declare(miniaudio
+    GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+    GIT_TAG 0.11.22
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR do-not-add)
+FetchContent_MakeAvailable(cgltf stb miniaudio)
+
 # ---------------- Движок (статическая библиотека) ----------------
 file(GLOB_RECURSE ENGINE_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(CustomEngine STATIC ${ENGINE_SOURCES})
 target_include_directories(CustomEngine
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include      # то, что видит игра: без Vulkan, glm и GLFW
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator Threads::Threads)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR} ${miniaudio_SOURCE_DIR})
+target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX)
+    target_link_libraries(CustomEngine PRIVATE m)
+endif()
 
 # Профилирование через Tracy: cmake -DCE_PROFILE=ON (по умолчанию выключено и ничего не стоит)
 option(CE_PROFILE "Профилирование через Tracy" OFF)
@@ -65,10 +88,10 @@ endif()
 if(MSVC)
     target_compile_options(CustomEngine PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(CustomEngine PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    set_source_files_properties(src/Vulkan/VmaImpl.cpp PROPERTIES COMPILE_OPTIONS "/W0")
+    set_source_files_properties(src/Vulkan/VmaImpl.cpp src/Amper/AssetImpl.cpp PROPERTIES COMPILE_OPTIONS "/W0")
 else()
     target_compile_options(CustomEngine PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-    set_source_files_properties(src/Vulkan/VmaImpl.cpp PROPERTIES COMPILE_OPTIONS "-w")
+    set_source_files_properties(src/Vulkan/VmaImpl.cpp src/Amper/AssetImpl.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 # ---------------- Шейдеры: GLSL -> SPIR-V ----------------
@@ -117,4 +140,6 @@ if(CE_BUILD_BENCH)
     target_link_libraries(UniXBench PRIVATE CustomEngine)
     add_executable(SceneBench bench/scene_bench.cpp)
     target_link_libraries(SceneBench PRIVATE CustomEngine)
+    add_executable(StressTest bench/stress.cpp)
+    target_link_libraries(StressTest PRIVATE CustomEngine)
 endif()

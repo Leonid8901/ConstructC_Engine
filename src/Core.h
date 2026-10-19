@@ -1,6 +1,7 @@
 #pragma once
 // Внутреннее ядро: доступ к подсистемам для фасадов публичного API.
 #include "CE/Amper.h"
+#include "CE/Audio.h"
 #include "CE/Engine.h"
 #include "CE/UniX.h"
 #include "CE/World.h"
@@ -21,6 +22,7 @@ class Scheduler;
 class WorldImpl;
 class Physics;
 class Renderer;
+class AudioSystem;
 struct CameraState;
 
 struct EngineCore {
@@ -33,13 +35,15 @@ struct EngineCore {
     WorldImpl* world = nullptr;
     Physics* grave = nullptr;
     Renderer* amper = nullptr;
+    AudioSystem* audio = nullptr;
     CameraState* camera = nullptr;
     EngineConfig config;  // итоговая: после профиля железа и engine.json
     SystemInfo system;
     std::atomic<bool> quit{false};
-    double time = 0;
-    float dt = 0;
-    uint64_t frame = 0;
+    // atomic: читаются из фоновых задач, пока главный поток начинает кадр
+    std::atomic<double> time{0};
+    std::atomic<float> dt{0};
+    std::atomic<uint64_t> frame{0};
 };
 
 EngineCore* CorePtr();
@@ -70,6 +74,16 @@ struct Access {
         m.m_id = id;
         return m;
     }
+    static Texture MakeTexture(uint32_t id) {
+        Texture t;
+        t.m_id = id;
+        return t;
+    }
+    static Model MakeModel(uint32_t id) {
+        Model m;
+        m.m_id = id;
+        return m;
+    }
 
     static Light MakeLight(uint32_t index, uint32_t gen) {
         Light l;
@@ -78,6 +92,21 @@ struct Access {
         return l;
     }
     static uint32_t Index(const Light& l) { return l.m_index; }
+
+    static Sound MakeSound(uint32_t id) {
+        Sound s;
+        s.m_id = id;
+        return s;
+    }
+    static uint32_t Id(const Sound& s) { return s.m_id; }
+    static Voice MakeVoice(uint32_t index, uint32_t gen) {
+        Voice v;
+        v.m_index = index;
+        v.m_gen = gen;
+        return v;
+    }
+    static uint32_t Index(const Voice& v) { return v.m_index; }
+    static uint32_t Gen(const Voice& v) { return v.m_gen; }
     static uint32_t Gen(const Light& l) { return l.m_gen; }
 
     static TaskHandle MakeHandle(std::shared_ptr<TaskRecord> rec) {

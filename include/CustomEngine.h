@@ -6,6 +6,7 @@
 #include "CE/UniX.h"
 #include "CE/Grave.h"
 #include "CE/Amper.h"
+#include "CE/Audio.h"
 #include "CE/Input.h"
 #include "CE/Engine.h"
 

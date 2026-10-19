@@ -18,6 +18,8 @@ struct Vec2 {
     constexpr Vec2 operator+(Vec2 o) const { return {x + o.x, y + o.y}; }
     constexpr Vec2 operator-(Vec2 o) const { return {x - o.x, y - o.y}; }
     constexpr Vec2 operator*(float s) const { return {x * s, y * s}; }
+    constexpr Vec2 operator/(float s) const { return {x / s, y / s}; }
+    constexpr Vec2& operator+=(Vec2 o) { x += o.x; y += o.y; return *this; }
 };
 
 struct Vec3 {
@@ -64,6 +66,7 @@ struct Vec4 {
     constexpr Vec4() = default;
     constexpr Vec4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
     constexpr Vec4(Vec3 v, float w_) : x(v.x), y(v.y), z(v.z), w(w_) {}
+    constexpr Vec3 Xyz() const { return {x, y, z}; }
 };
 
 struct Quat {
@@ -99,6 +102,20 @@ inline Quat Normalize(Quat q) {
 }
 inline Quat Quat::Euler(float pitch, float yaw, float roll) {
     return AxisAngle({0, 1, 0}, yaw) * AxisAngle({1, 0, 0}, pitch) * AxisAngle({0, 0, 1}, roll);
+}
+constexpr float Dot(Quat a, Quat b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+// Сферическая интерполяция по кратчайшей дуге (для анимаций)
+inline Quat Slerp(Quat a, Quat b, float t) {
+    float d = Dot(a, b);
+    if (d < 0) {
+        b = {-b.x, -b.y, -b.z, -b.w};
+        d = -d;
+    }
+    if (d > 0.9995f)  // почти совпадают: линейно + нормализация
+        return Normalize(Quat{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t});
+    const float th = std::acos(d), s = std::sin(th);
+    const float wa = std::sin((1 - t) * th) / s, wb = std::sin(t * th) / s;
+    return {a.x * wa + b.x * wb, a.y * wa + b.y * wb, a.z * wa + b.z * wb, a.w * wa + b.w * wb};
 }
 
 // m[row][col]
@@ -211,6 +228,15 @@ struct Mat4 {
         return {m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
                 m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
                 m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]};
+    }
+    Vec3 TransformVector(Vec3 v) const {
+        return {m[0] * v.x + m[4] * v.y + m[8] * v.z, m[1] * v.x + m[5] * v.y + m[9] * v.z,
+                m[2] * v.x + m[6] * v.y + m[10] * v.z};
+    }
+    // Наибольшая длина базисного вектора: во сколько раз матрица может растянуть радиус
+    float MaxScale() const {
+        auto len2 = [&](int c) { return m[c * 4] * m[c * 4] + m[c * 4 + 1] * m[c * 4 + 1] + m[c * 4 + 2] * m[c * 4 + 2]; };
+        return std::sqrt(std::max(len2(0), std::max(len2(1), len2(2))));
     }
 };
 

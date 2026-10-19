@@ -1,14 +1,38 @@
 // Пример игры на CustomEngine: ни Vulkan, ни glm, ни GLFW здесь не видно.
+// Запуск: Sandbox [модель.glb|.gltf] [музыка.mp3|.wav|.flac] — модель встанет на пол перед стеной,
+//         музыка заиграет фоном (N — вкл/выкл).
 //
 // Управление: ПКМ + мышь — обзор, WASD/QE — полёт (Shift — быстрее),
 //             ЛКМ/Space — выстрел шаром, R — ray tracing вкл/выкл,
 //             T — карты теней вкл/выкл (работают при выключенном RT), M — сглаживание (MSAA 1/2/4/8),
-//             Esc — выход.
+//             N — музыка, +/- — общая громкость, Esc — выход.
 #include <CustomEngine.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <vector>
+
+static std::string g_modelPath;  // Sandbox путь/к/модели.glb — показать свою модель
+static std::string g_musicPath;  // и/или путь к музыке
+
+// Звуки без файлов: синтезируем сэмплы (Sound::Create). В своей игре — Sound::Load("shot.wav").
+static Sound Synth(float seconds, float (*wave)(float t, float k)) {
+    constexpr uint32_t kRate = 44100;
+    std::vector<float> s(static_cast<size_t>(seconds * kRate));
+    for (size_t i = 0; i < s.size(); ++i) {
+        const float t = static_cast<float>(i) / kRate;
+        s[i] = wave(t, t / seconds);  // k: 0..1 — доля длительности
+    }
+    return Sound::Create(s.data(), static_cast<uint32_t>(s.size()), 1, kRate);
+}
+static float Noise(float t) {  // детерминированный «шум»
+    const float x = std::sin(t * 12.9898f * 1000.0f) * 43758.5453f;
+    return (x - std::floor(x)) * 2.0f - 1.0f;
+}
 
 class Demo : public Game {
 public:
@@ -23,11 +47,42 @@ public:
         World.SetBounds({-45, -20, -45}, {45, 100, 45});
         World.SetOutOfBoundsAction(OutOfBounds::Destroy);
 
-        // Пол
+        // Пол: текстура-шахматка, собранная в памяти (Texture::Create), повтор каждые 2 м
+        std::vector<uint8_t> checker(64 * 64 * 4);
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                const uint8_t v = ((x / 32) + (y / 32)) % 2 ? 120 : 90;
+                uint8_t* p = &checker[(y * 64 + x) * 4];
+                p[0] = v; p[1] = static_cast<uint8_t>(v + 4); p[2] = static_cast<uint8_t>(v + 8); p[3] = 255;
+            }
+        Material floor;
+        floor.color = {1, 1, 1};
+        floor.roughness = 0.85f;
+        floor.baseColorMap = Texture::Create(checker.data(), 64, 64);
+        floor.uvScale = {0.5f, 0.5f};
         World.Spawn()
             .SetMesh(Mesh::Plane(80))
-            .SetMaterial({{0.32f, 0.34f, 0.36f}, 0.85f})
+            .SetMaterial(floor)
             .AddBody({BodyType::Static, Shape::Plane()});
+
+        // Своя модель из командной строки: ставим её на пол перед стеной
+        if (!g_modelPath.empty()) {
+            try {
+                Model m = Model::Load(g_modelPath);
+                const Vec3 lo = m.BoundsMin(), hi = m.BoundsMax();
+                const float size = std::max(hi.x - lo.x, std::max(hi.y - lo.y, hi.z - lo.z));
+                const float s = size > 0 ? 2.5f / size : 1.0f;  // вписываем в 2,5 м
+                Entity e = World.Spawn().SetModel(m).SetScale(s).SetPosition({0, -lo.y * s, 4});
+                std::printf("[game] модель %s: частей %u, анимаций %u\n", g_modelPath.c_str(), m.PartCount(),
+                            m.AnimationCount());
+                if (m.AnimationCount() > 0) {  // играем первую по кругу
+                    e.PlayAnimation(0u);
+                    std::printf("[game] анимация: %s (%.2f с)\n", m.AnimationName(0).c_str(), m.AnimationDuration(0));
+                }
+            } catch (const std::exception& e) {
+                std::printf("[game] не удалось загрузить модель: %s\n", e.what());
+            }
+        }
 
         // Стена из кубов
         const Mesh cube = Mesh::Cube();
@@ -62,9 +117,44 @@ public:
         m_zone = World.Spawn()
                      .SetPosition({0, 1, -6})
                      .AddBody({BodyType::Static, Shape::Box({3, 1, 1}), 0, 0.5f, 0, 0, 0, true});
+        // ---------------- Звук ----------------
+        // Выстрел — «пиу» с падающей частотой, удар — короткий шумовой щелчок, зона — двойной тон,
+        // светильник — гул, который едет вместе с ним (3D: громче рядом, панорама по взгляду камеры)
+        m_shot = Synth(0.18f, [](float t, float k) { return 0.5f * std::sin(6.2832f * (900.0f - 2400.0f * t) * t) * (1 - k); });
+        m_hit = Synth(0.09f, [](float t, float k) { return 0.8f * Noise(t) * (1 - k) * (1 - k); });
+        m_chime = Synth(0.35f, [](float t, float k) {
+            return 0.35f * (std::sin(6.2832f * 660 * t) + std::sin(6.2832f * 990 * t)) * (1 - k);
+        });
+        Sound hum = Synth(1.0f, [](float t, float) {  // ровно 110 периодов: петля без щелчка
+            return 0.25f * std::sin(6.2832f * 110 * t) + 0.1f * std::sin(6.2832f * 220 * t);
+        });
+        if (!g_musicPath.empty()) {
+            try {
+                m_music = Sound::Load(g_musicPath, true);  // stream: длинную музыку декодируем на лету
+                Audio.PlayMusic(m_music, 2.0f);
+                std::printf("[game] музыка: %s (%.0f с)\n", g_musicPath.c_str(), m_music.Duration());
+            } catch (const std::exception& e) {
+                std::printf("[game] не удалось загрузить музыку: %s\n", e.what());
+            }
+        }
+
         Grave.OnContact([this](const ContactEvent& e) {
-            if (e.trigger && (e.a == m_zone || e.b == m_zone))
+            if (e.trigger && (e.a == m_zone || e.b == m_zone)) {
                 std::printf("[game] что-то влетело в триггер-зону\n");
+                Audio.PlayAt(m_chime, e.point, 0.6f);
+                return;
+            }
+            // Удары: не чаще раза в 40 мс, иначе осыпающаяся стена — сплошной треск
+            const double now = Engine::Time();
+            if (now - m_lastHit > 0.04) {
+                m_lastHit = now;
+                SoundParams p;
+                p.spatial = true;
+                p.position = e.point;
+                p.volume = 0.5f;
+                p.pitch = 0.8f + 0.4f * static_cast<float>(std::fmod(now * 7.3, 1.0));
+                Audio.Play(m_hit, p);
+            }
         });
 
         // Светильник, облетающий сцену (с RT-тенями)
@@ -73,6 +163,15 @@ public:
                          .SetMesh(Mesh::Sphere(16))
                          .SetScale(0.3f)
                          .SetMaterial({{1, 0.6f, 0.3f}, 0.5f, 0, {4.0f, 2.2f, 1.0f}});
+        {
+            SoundParams p;
+            p.loop = true;
+            p.follow = m_lampBall;  // звук едет за сущностью
+            p.volume = 0.6f;
+            p.minDistance = 1.5f;
+            p.maxDistance = 25.0f;
+            Audio.Play(hum, p);
+        }
 
         // ---------------- Задачи UniX ----------------
 
@@ -99,10 +198,11 @@ public:
         });
 
         const Mesh ball = Mesh::Sphere();
-        UniX.CreateTask.NewTask("Shooter", Cost::Low, Priority::Normal, [ball](Task&) {
+        UniX.CreateTask.NewTask("Shooter", Cost::Low, Priority::Normal, [this, ball](Task&) {
             if (!Input.MousePressed(MouseButton::Left) && !Input.Pressed(Key::Space))
                 return;
             Vec3 f = Camera.Forward();
+            Audio.Play(m_shot, {0.7f});  // 2D: у самого уха
             World.Spawn()
                 .SetMesh(ball)
                 .SetScale(0.6f)
@@ -140,7 +240,7 @@ public:
             t.State<uint32_t>() = hits.load();
         });
 
-        UniX.CreateTask.NewTask("Controls", Cost::Low, Priority::High, [](Task&) {
+        UniX.CreateTask.NewTask("Controls", Cost::Low, Priority::High, [this](Task&) {
             if (Input.Pressed(Key::R)) {
                 Amper.SetRayTracing(!Amper.RayTracing());
                 std::printf("[game] ray tracing: %s\n", Amper.RayTracing() ? "on" : (Amper.RayTracingSupported() ? "off" : "не поддерживается GPU"));
@@ -157,6 +257,19 @@ public:
                     next = 1;
                 Amper.SetAntialiasing(next);
                 std::printf("[game] MSAA: %ux\n", next);
+            }
+            if (Input.Pressed(Key::N) && m_music.Valid()) {
+                m_musicOn = !m_musicOn;
+                if (m_musicOn)
+                    Audio.PlayMusic(m_music, 1.0f);
+                else
+                    Audio.StopMusic(1.0f);
+            }
+            const bool louder = Input.Pressed(Key::Equal) || Input.Pressed(Key::KpAdd);
+            if (louder || Input.Pressed(Key::Minus) || Input.Pressed(Key::KpSubtract)) {
+                const float v = std::clamp(Audio.MasterVolume() + (louder ? 0.1f : -0.1f), 0.0f, 1.0f);
+                Audio.SetMasterVolume(v);
+                std::printf("[game] громкость: %.0f%%\n", v * 100);
             }
             if (Input.Pressed(Key::Escape))
                 Engine::Quit();
@@ -196,9 +309,17 @@ private:
     Entity m_lampBall;
     Light m_lamp;
     TaskHandle m_radar;
+    Sound m_shot, m_hit, m_chime, m_music;
+    bool m_musicOn = true;
+    double m_lastHit = 0;
 };
 
-int main() {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i], ext = a.size() > 4 ? a.substr(a.size() - 4) : "";
+        for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        (ext == ".mp3" || ext == ".wav" || ext == "flac" ? g_musicPath : g_modelPath) = a;
+    }
     EngineConfig config;
     config.title = "CustomEngine Sandbox";
     config.rayTracing = true;  // если GPU не умеет — останется растеризация

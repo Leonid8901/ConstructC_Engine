@@ -10,6 +10,7 @@
 #include "CE/Engine.h"
 #include "CE/Input.h"
 #include "Core.h"
+#include "Audio/AudioSystem.h"
 #include "Grave/Physics.h"
 #include "Platform/Hardware.h"
 #include "Platform/Input.h"
@@ -23,6 +24,7 @@
 #include "World/WorldImpl.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
@@ -135,6 +137,16 @@ int Engine::Run(Game& game, const EngineConfig& requested) {
         amper.SetShadows(settings.shadows);
         amper.SetShadowDistance(settings.shadowDistance);
 
+        AudioSettings audioSettings;
+        audioSettings.enabled = user.audioEnabled >= 0 ? user.audioEnabled != 0 : cfg.audio;
+        if (user.audioMaster >= 0)
+            audioSettings.master = user.audioMaster;
+        for (size_t g = 0; g < audioSettings.groups.size(); ++g)
+            if (user.audioGroups[g] >= 0)
+                audioSettings.groups[g] = user.audioGroups[g];
+        AudioSystem audio(audioSettings);
+        Log("Звук: " + audio.Description());
+
         ec.input = &input;
         ec.window = &window;
         ec.vk = &vk;
@@ -144,6 +156,7 @@ int Engine::Run(Game& game, const EngineConfig& requested) {
         ec.grave = &grave;
         ec.camera = &camera;
         ec.amper = &amper;
+        ec.audio = &audio;
         SetCore(&ec);
         struct CoreReset {
             ~CoreReset() { SetCore(nullptr); }
@@ -186,11 +199,11 @@ int Engine::Run(Game& game, const EngineConfig& requested) {
             const auto now = clock::now();
             const float dt = std::min(std::chrono::duration<float>(now - prev).count(), 0.25f);
             prev = now;
-            ec.time = std::chrono::duration<double>(now - start).count();
-            ec.dt = dt;
-            ++ec.frame;
+            ec.time.store(std::chrono::duration<double>(now - start).count());
+            ec.dt.store(dt);
+            ec.frame.fetch_add(1);
 
-            scheduler.BeginFrame(ec.time, dt, ec.frame);
+            scheduler.BeginFrame(ec.time.load(), dt, ec.frame.load());
             scheduler.RunStage(Stage::Update);
             {
                 CE_ZONE("World.Flush");
@@ -203,6 +216,17 @@ int Engine::Run(Game& game, const EngineConfig& requested) {
                 world.Flush();
                 world.EnforceBounds();  // KillZ / возврат вылетевших
                 grave.RefreshQueries(); // дерево для Raycast на следующий кадр
+                Vec3 camPos;
+                float yaw, pitch;
+                {
+                    std::lock_guard lk(camera.mutex);
+                    camPos = camera.pos;
+                    yaw = camera.yaw;
+                    pitch = camera.pitch;
+                }
+                const Vec3 fwd{std::cos(pitch) * std::sin(yaw), std::sin(pitch), -std::cos(pitch) * std::cos(yaw)};
+                const Vec3 right = Normalize(Cross(fwd, {0, 1, 0}));
+                audio.Update(camPos, fwd, Cross(right, fwd), world);  // слушатель = камера
             }
             scheduler.RunStage(Stage::Prepare);
 
@@ -240,9 +264,9 @@ void Engine::Quit() {
     if (auto* c = core::CorePtr())
         c->quit.store(true);
 }
-double Engine::Time() { return core::Core().time; }
-float Engine::DeltaTime() { return core::Core().dt; }
-uint64_t Engine::Frame() { return core::Core().frame; }
+double Engine::Time() { return core::Core().time.load(std::memory_order_relaxed); }
+float Engine::DeltaTime() { return core::Core().dt.load(std::memory_order_relaxed); }
+uint64_t Engine::Frame() { return core::Core().frame.load(std::memory_order_relaxed); }
 const SystemInfo& Engine::System() { return core::Core().system; }
 
 // ---------------- Input ----------------
