@@ -70,7 +70,8 @@
     "shadowMapSize": "auto",
     "shadowDistance": "auto"
   },
-  "window": { "platform": "auto" }
+  "window": { "platform": "auto" },
+  "audio": { "enabled": "auto", "master": "auto", "effects": "auto", "music": "auto", "voice": "auto", "ui": "auto" }
 }
 ```
 
@@ -88,6 +89,8 @@
 | `settings.shadowMapSize` | 512…8192 | округляется вверх до степени двойки |
 | `settings.shadowDistance` | метры | дальность каскадных теней |
 | `window.platform` | `auto`, `x11`, `wayland`, `win32` | Linux: `auto` — Wayland в Wayland-сессии, иначе X11. Не получилось — откат на `auto` |
+| `audio.enabled` | `true` / `false` | выключить звук целиком |
+| `audio.master`, `effects`, `music`, `voice`, `ui` | 0…1 | громкости: общая и по группам |
 
 Любое поле можно удалить или оставить `"auto"` — тогда решает движок.
 

@@ -51,15 +51,25 @@ FetchContent_Declare(stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
     GIT_TAG a7d4c2175630e1ea5b6f8dd00ab96fed0b97b96d
     SOURCE_SUBDIR do-not-add)
-FetchContent_MakeAvailable(cgltf stb)
+# miniaudio — звук (WASAPI/DirectSound на Windows, PulseAudio/ALSA/JACK на Linux; системные
+# аудиобиблиотеки грузятся во время работы, при сборке пакеты не нужны). Декодеры WAV/MP3/FLAC встроены.
+FetchContent_Declare(miniaudio
+    GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+    GIT_TAG 0.11.22
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR do-not-add)
+FetchContent_MakeAvailable(cgltf stb miniaudio)
 
 # ---------------- Движок (статическая библиотека) ----------------
 file(GLOB_RECURSE ENGINE_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(CustomEngine STATIC ${ENGINE_SOURCES})
 target_include_directories(CustomEngine
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include      # то, что видит игра: без Vulkan, glm и GLFW
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR})
-target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator Threads::Threads)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR} ${miniaudio_SOURCE_DIR})
+target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX)
+    target_link_libraries(CustomEngine PRIVATE m)
+endif()
 
 # Профилирование через Tracy: cmake -DCE_PROFILE=ON (по умолчанию выключено и ничего не стоит)
 option(CE_PROFILE "Профилирование через Tracy" OFF)

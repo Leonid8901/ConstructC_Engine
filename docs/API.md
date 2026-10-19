@@ -12,6 +12,7 @@
 - [Model](#model) и [анимации](#анимации)
 - [Texture](#texture)
 - [Material и Vertex](#material-и-vertex)
+- [Audio](#audio)
 - [Camera](#camera)
 - [Input](#input)
 - [Математика](#математика)
@@ -255,6 +256,58 @@ struct Material {
 ```
 
 Числа умножаются на текстуры (как в glTF): `color × baseColorMap.rgb`, `roughness × mr.g`, `metallic × mr.b`, `emissive × emissiveMap.rgb`. Подробности модели — [Amper.md](Amper.md#2-модель-освещения).
+
+## Audio
+
+Звук на [miniaudio](https://miniaud.io): WASAPI/DirectSound на Windows, PulseAudio/ALSA/JACK на Linux (системные библиотеки грузятся во время работы, ставить при сборке ничего не нужно). Форматы файлов: WAV, MP3, FLAC. Все методы потокобезопасны, звать можно из любой задачи.
+
+```cpp
+Sound shot  = Sound::Load("assets/shot.wav");             // целиком в память: эффекты
+Sound theme = Sound::Load("assets/theme.mp3", true);      // stream: длинная музыка, декод на лету
+
+Audio.Play(shot);                                         // 2D, «у уха»
+Audio.PlayAt(shot, hitPoint, 0.8f);                       // 3D в точке
+Voice v = Audio.PlayOn(engineHum, car, 1.0f, true);       // 3D, едет за сущностью, по кругу
+Audio.PlayMusic(theme, 2.0f);                             // музыка с плавной сменой
+Audio.SetGroupVolume(AudioGroup::Music, 0.5f);
+v.Stop(0.3f);                                             // затихнуть за 0,3 с
+```
+
+| `Sound` | Описание |
+|---|---|
+| `static Sound Load(const std::string& path, bool stream = false)` | загрузить файл; повторный вызов с тем же путём — тот же звук; ошибка — `std::runtime_error` |
+| `static Sound Create(const float* samples, uint32_t frames, uint32_t channels, uint32_t sampleRate)` | свои сэмплы (−1…1, каналы чередуются), данные копируются |
+| `float Duration()` | длительность, с |
+
+`SoundParams` для `Audio.Play`:
+
+| Поле | По умолчанию | Описание |
+|---|---|---|
+| `volume`, `pitch` | 1, 1 | `pitch` 2 — на октаву выше и вдвое быстрее |
+| `loop` | false | по кругу |
+| `group` | `Effects` | `Effects`, `Music`, `Voice`, `UI` — своя громкость у каждой |
+| `spatial` | false | 3D-звук в `position` |
+| `follow` | — | сущность: звук едет за ней и затихает, когда её удалят. Можно передать сущность, созданную в этой же задаче |
+| `minDistance`, `maxDistance` | 1 м, 60 м | ближе `min` — полная громкость, дальше `max` — громкость больше не падает (затухание обратно пропорционально расстоянию) |
+| `fadeIn` | 0 | нарастание, с |
+
+| `Audio` | Описание |
+|---|---|
+| `Voice Play(Sound, const SoundParams& = {})` | запустить; вернёт пустой `Voice`, если звук не запустился |
+| `Voice PlayAt(Sound, Vec3 position, float volume = 1)` | 3D в точке |
+| `Voice PlayOn(Sound, Entity, float volume = 1, bool loop = false)` | 3D за сущностью |
+| `void PlayMusic(Sound, float fadeSeconds = 1, bool loop = true, float volume = 1)` | одна музыкальная дорожка; новая плавно сменяет старую |
+| `void StopMusic(float fadeSeconds = 1)` | |
+| `SetMasterVolume` / `MasterVolume`, `SetGroupVolume` / `GroupVolume` | громкости 0…1 |
+| `void StopAll(float fadeSeconds = 0)` | остановить всё, кроме музыки |
+| `bool Available()` | `false` — звук выключен в `engine.json`/`EngineConfig::audio` или не запустился; тогда все вызовы ничего не делают |
+| `uint32_t PlayingCount()` | сколько звуков играет |
+
+`Voice` — дескриптор играющего звука: `Playing()`, `SetVolume`, `SetPitch`, `SetPosition`, `Stop(fade)`. После окончания звука дескриптор невалиден, вызовы на нём ничего не делают.
+
+Слушатель — камера (позиция и направление взгляда; панорама и затухание считает miniaudio). Звуки за сущностями обновляются раз в кадр после физики. Одновременно — до 256 звуков, лишние пропускаются (в лог — один раз). Если звуковой карты нет, miniaudio выбирает «пустой» вывод: всё работает, но тихо, `Available()` возвращает `true`, в логе — `Звук: Null … (устройства нет — тишина)`.
+
+Не поддерживается: OGG Vorbis (нужен отдельный декодер), эффект Доплера, реверберация и фильтры, перекрытие звука стенами.
 
 ## Camera
 

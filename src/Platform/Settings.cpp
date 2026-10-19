@@ -46,7 +46,17 @@ constexpr const char* kDefaultConfig = R"({
   "window": {
     "platform": "auto"
   },
-  "_window_help": "platform: auto / x11 / wayland (Linux) / win32"
+  "_window_help": "platform: auto / x11 / wayland (Linux) / win32",
+
+  "audio": {
+    "enabled": "auto",
+    "master": "auto",
+    "effects": "auto",
+    "music": "auto",
+    "voice": "auto",
+    "ui": "auto"
+  },
+  "_audio_help": "громкость 0..1; enabled: false — без звука"
 }
 )";
 
@@ -177,6 +187,13 @@ UserConfig LoadUserConfig(const std::filesystem::path& path, bool createIfMissin
     u.shadowMapSize = ReadInt(st["shadowMapSize"]);
     u.shadowDistance = st["shadowDistance"].IsNumber() ? static_cast<float>(st["shadowDistance"].AsNumber()) : -1.0f;
     u.windowPlatform = Lower(ReadString(root["window"]["platform"]));
+    const Json& au = root["audio"];
+    u.audioEnabled = ReadBool(au["enabled"]);
+    auto vol = [](const Json& v) { return v.IsNumber() ? std::max(0.0f, static_cast<float>(v.AsNumber())) : -1.0f; };
+    u.audioMaster = vol(au["master"]);
+    const char* names[4] = {"effects", "music", "voice", "ui"};
+    for (int g = 0; g < 4; ++g)
+        u.audioGroups[g] = vol(au[names[g]]);
     return u;
 }
 
