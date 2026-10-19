@@ -24,6 +24,10 @@ void AmperApi::SetExposure(float exposure) const { R().SetExposure(exposure); }
 void AmperApi::SetShadows(bool enabled) const { R().SetShadows(enabled); }
 bool AmperApi::Shadows() const { return R().Shadows(); }
 void AmperApi::SetShadowDistance(float meters) const { R().SetShadowDistance(meters); }
+void AmperApi::SetAntialiasing(uint32_t samples) const { R().SetSamples(samples); }
+uint32_t AmperApi::Antialiasing() const { return R().Samples(); }
+uint32_t AmperApi::MaxAntialiasing() const { return R().MaxSamples(); }
+bool AmperApi::AntialiasingSupported(uint32_t samples) const { return R().SamplesSupported(samples); }
 uint32_t AmperApi::LightCount() const { return R().LightCount(); }
 uint32_t AmperApi::DrawCalls() const { return R().DrawCalls(); }
 uint32_t AmperApi::Instances() const { return R().Instances(); }

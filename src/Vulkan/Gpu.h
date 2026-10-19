@@ -54,7 +54,7 @@ public:
     void Destroy(Buffer& b);
 
     Image CreateImage2D(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                        uint32_t layers = 1);
+                        uint32_t layers = 1, VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
     void Destroy(Image& img);
 
     VkDevice Device() const { return m_device; }

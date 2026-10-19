@@ -44,6 +44,14 @@ private:
     uint32_t m_id = UINT32_MAX;
 };
 
+// Что делать с сущностью, вылетевшей за область мира (см. WorldApi::SetBounds / SetKillY).
+enum class OutOfBounds : uint8_t {
+    Default,  // только для сущности: действие по умолчанию из World.SetOutOfBoundsAction (для движущихся тел)
+    None,     // не трогать
+    Destroy,  // удалить сущность
+    Respawn,  // вернуть в точку возврата: положение и поворот, нулевые скорости
+};
+
 class Entity {
 public:
     Entity() = default;
@@ -64,6 +72,12 @@ public:
     Entity& SetMaterial(const Material& m);
     Entity& SetColor(Vec3 c);
     Entity& SetVisible(bool v);
+
+    // Поведение за границами мира. Без вызова сущность с динамическим/кинематическим телом получает действие
+    // по умолчанию из World.SetOutOfBoundsAction, остальные сущности не трогаются.
+    // Respawn без явной точки возвращает в положение, где сущность была при AddBody (или при включении Respawn).
+    Entity& SetOutOfBounds(OutOfBounds action);
+    Entity& SetRespawnPoint(Vec3 position, Quat rotation = Quat{});
 
     Entity& AddBody(const BodyDesc& desc);
     Entity& RemoveBody();
@@ -87,6 +101,15 @@ private:
 struct WorldApi {
     Entity Spawn() const;
     uint32_t Count() const;
+
+    // Область мира. Сущность, центр которой вышел за неё, получает действие OutOfBounds
+    // (проверка раз в кадр после физики). По умолчанию область выключена.
+    void SetBounds(Vec3 min, Vec3 max) const;
+    // Только нижняя граница по Y («KillZ» из Unreal; у нас Y вверх). Остальные границы не меняются.
+    void SetKillY(float y) const;
+    void ClearBounds() const;
+    // Действие по умолчанию для сущностей с движущимися телами; по умолчанию Destroy. Допустимы None/Destroy/Respawn.
+    void SetOutOfBoundsAction(OutOfBounds action) const;
 };
 inline constexpr WorldApi World{};
 

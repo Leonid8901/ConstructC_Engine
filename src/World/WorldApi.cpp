@@ -91,6 +91,21 @@ Entity& Entity::SetVisible(bool v) {
     return *this;
 }
 
+Entity& Entity::SetOutOfBounds(OutOfBounds action) {
+    Command c = Cmd(CmdType::SetOutOfBounds, *this);
+    c.u = static_cast<uint32_t>(action);
+    W().Submit(c);
+    return *this;
+}
+
+Entity& Entity::SetRespawnPoint(Vec3 position, Quat rotation) {
+    Command c = Cmd(CmdType::SetHome, *this);
+    c.v = position;
+    c.q = rotation;
+    W().Submit(c);
+    return *this;
+}
+
 Entity& Entity::AddBody(const BodyDesc& desc) {
     Command c = Cmd(CmdType::AddBody, *this);
     c.body = desc;
@@ -107,6 +122,35 @@ Entity& Entity::RemoveBody() {
 
 Entity WorldApi::Spawn() const { return W().Spawn(); }
 uint32_t WorldApi::Count() const { return W().AliveCount(); }
+
+void WorldApi::SetBounds(Vec3 min, Vec3 max) const {
+    W().EditBounds([&](core::WorldBounds& b) {
+        b.enabled = true;
+        b.min = Min(min, max);
+        b.max = Max(min, max);
+    });
+}
+
+void WorldApi::SetKillY(float y) const {
+    W().EditBounds([&](core::WorldBounds& b) {
+        b.enabled = true;
+        b.min.y = y;
+    });
+}
+
+void WorldApi::ClearBounds() const {
+    W().EditBounds([](core::WorldBounds& b) {
+        const OutOfBounds action = b.action;
+        b = core::WorldBounds{};
+        b.action = action;
+    });
+}
+
+void WorldApi::SetOutOfBoundsAction(OutOfBounds action) const {
+    if (action == OutOfBounds::Default)
+        action = OutOfBounds::Destroy;
+    W().EditBounds([&](core::WorldBounds& b) { b.action = action; });
+}
 
 // ---------------- Camera ----------------
 

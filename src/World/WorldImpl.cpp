@@ -92,6 +92,56 @@ void WorldImpl::Flush() {
     }
 }
 
+WorldBounds WorldImpl::Bounds() {
+    std::lock_guard lk(m_boundsMutex);
+    return m_bounds;
+}
+
+// Сущности за областью мира: удалить или вернуть в точку возврата.
+// Проверяется центр сущности (позиция), а не её AABB: объект исчезает, когда «вылетел», а не когда коснулся края.
+void WorldImpl::EnforceBounds() {
+    const WorldBounds b = Bounds();
+    if (!b.enabled)
+        return;
+    Physics& ph = *Core().grave;
+    const uint32_t cap = Capacity();
+    for (uint32_t i = 0; i < cap; ++i) {
+        EntityData* page = m_pages[i >> kPageBits].load(std::memory_order_acquire);
+        if (!page) {
+            i |= kPageSize - 1;  // страница не выделена — к следующей
+            continue;
+        }
+        EntityData& d = page[i & (kPageSize - 1)];
+        if (!d.alive)
+            continue;
+        OutOfBounds action = d.oob != OutOfBounds::Default ? d.oob : (d.moves ? b.action : OutOfBounds::None);
+        if (action == OutOfBounds::None || action == OutOfBounds::Default)
+            continue;
+        const Vec3 p = d.pos;
+        if (p.x >= b.min.x && p.y >= b.min.y && p.z >= b.min.z && p.x <= b.max.x && p.y <= b.max.y && p.z <= b.max.z)
+            continue;
+
+        if (action == OutOfBounds::Respawn && d.hasHome) {
+            d.pos = d.home;
+            d.rot = d.homeRot;
+            d.velocity = Vec3{};
+            if (d.body != UINT32_MAX) {
+                ph.SetPosition(d.body, d.home);
+                ph.SetRotation(d.body, d.homeRot);
+                ph.SetVelocity(d.body, Vec3{});
+                ph.SetAngularVelocity(d.body, Vec3{});
+            }
+            continue;
+        }
+        // Destroy (или Respawn, когда возвращать некуда)
+        Command c{};
+        c.type = CmdType::Destroy;
+        c.index = i;
+        c.gen = d.gen;
+        Apply(c);
+    }
+}
+
 void WorldImpl::Apply(const Command& c) {
     if (c.index >= Capacity())
         return;
@@ -150,8 +200,31 @@ void WorldImpl::Apply(const Command& c) {
     case CmdType::AddBody:
         removeBody();
         d.body = ph.AddBody(c.body, d.pos, d.rot, c.index, d.gen);
+        d.moves = c.body.type != BodyType::Static && c.body.shape.type != Shape::Type::Plane;
+        if (!d.homeExplicit) {
+            d.home = d.pos;
+            d.homeRot = d.rot;
+            d.hasHome = true;
+        }
         break;
-    case CmdType::RemoveBody: removeBody(); break;
+    case CmdType::RemoveBody:
+        removeBody();
+        d.moves = false;
+        break;
+    case CmdType::SetOutOfBounds:
+        d.oob = static_cast<OutOfBounds>(c.u);
+        if (d.oob == OutOfBounds::Respawn && !d.hasHome) {
+            d.home = d.pos;
+            d.homeRot = d.rot;
+            d.hasHome = true;
+        }
+        break;
+    case CmdType::SetHome:
+        d.home = c.v;
+        d.homeRot = Normalize(c.q);
+        d.hasHome = true;
+        d.homeExplicit = true;
+        break;
     case CmdType::SetVel:
         d.velocity = c.v;
         if (d.body != UINT32_MAX) ph.SetVelocity(d.body, c.v);

@@ -60,6 +60,9 @@ public:
     void DispatchEvents();  // главный поток
 
     bool Raycast(Vec3 origin, Vec3 dir, float maxDist, RaycastHit& hit, uint32_t mask) const;
+    // Перестроить дерево для лучей, если тела менялись (главный поток, вне стадий). Без него Raycast
+    // остаётся корректным, но перебирает все тела.
+    void RefreshQueries();
     void AddCallback(std::function<void(const ContactEvent&)> cb);
 
     void SetGravity(Vec3 g);
@@ -94,6 +97,12 @@ private:
     void Wake(Body& b);
     bool Active(const Body& b) const;
     uint32_t Find(uint32_t i);
+    void BuildRayTree();
+    void BuildRayNode(uint32_t node, uint32_t begin, uint32_t end);
+    bool RaycastLinear(Vec3 origin, Vec3 dir, float maxDist, uint32_t mask, float& best, const Body*& bestBody,
+                       Vec3& bestN) const;
+    bool RaycastTree(Vec3 origin, Vec3 dir, float maxDist, uint32_t mask, float& best, const Body*& bestBody,
+                     Vec3& bestN) const;
 
     std::vector<Body> m_bodies;
     std::vector<uint32_t> m_sapOrder;
@@ -112,6 +121,18 @@ private:
     std::vector<uint32_t> m_islandContacts;  // индексы в m_contacts, сгруппированные по островам
     std::vector<uint8_t> m_islandAwake;
     std::vector<float> m_islandMinSleep;
+
+    // BVH по AABB тел для Raycast: строится раз в кадр после физики (RefreshQueries).
+    // Узел-лист: count > 0, first — начало в m_rayItems; внутренний: count == 0, дети first и first + 1.
+    struct RayNode {
+        Aabb box;
+        uint32_t first = 0;
+        uint32_t count = 0;
+    };
+    std::vector<RayNode> m_rayNodes;
+    std::vector<uint32_t> m_rayItems;   // индексы тел
+    std::vector<uint32_t> m_rayPlanes;  // плоскости бесконечны — проверяются отдельно
+    bool m_rayValid = false;
 
     std::vector<PendingEvent> m_events;
     std::mutex m_cbMutex;

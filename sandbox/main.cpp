@@ -2,7 +2,8 @@
 //
 // Управление: ПКМ + мышь — обзор, WASD/QE — полёт (Shift — быстрее),
 //             ЛКМ/Space — выстрел шаром, R — ray tracing вкл/выкл,
-//             T — карты теней вкл/выкл (работают при выключенном RT), Esc — выход.
+//             T — карты теней вкл/выкл (работают при выключенном RT), M — сглаживание (MSAA 1/2/4/8),
+//             Esc — выход.
 #include <CustomEngine.h>
 
 #include <atomic>
@@ -16,6 +17,11 @@ public:
         Amper.SetAmbient({0.45f, 0.55f, 0.7f}, 0.35f);
         Camera.SetPosition({0, 5, 16});
         Camera.LookAt({0, 2, 0});
+
+        // Область мира: всё, что вылетело за пол (80x80) или провалилось, — удаляется (шары),
+        // а объекты сцены с флагом Respawn возвращаются на свои места.
+        World.SetBounds({-45, -20, -45}, {45, 100, 45});
+        World.SetOutOfBoundsAction(OutOfBounds::Destroy);
 
         // Пол
         World.Spawn()
@@ -31,7 +37,8 @@ public:
                     .SetMesh(cube)
                     .SetPosition({x * 1.02f, 0.5f + y * 1.0f, 0})
                     .SetColor({0.85f - 0.07f * y, 0.35f + 0.08f * (x + 2), 0.25f + 0.06f * y})
-                    .AddBody({BodyType::Dynamic, Shape::Box({0.5f, 0.5f, 0.5f}), 1.0f, 0.6f});
+                    .AddBody({BodyType::Dynamic, Shape::Box({0.5f, 0.5f, 0.5f}), 1.0f, 0.6f})
+                    .SetOutOfBounds(OutOfBounds::Respawn);
 
         // Металлический шар и капсулы
         World.Spawn()
@@ -39,7 +46,8 @@ public:
             .SetScale(2.0f)
             .SetPosition({-6, 1, 3})
             .SetMaterial({{0.95f, 0.8f, 0.4f}, 0.25f, 1.0f})
-            .AddBody({BodyType::Dynamic, Shape::Sphere(1.0f), 5.0f});
+            .AddBody({BodyType::Dynamic, Shape::Sphere(1.0f), 5.0f})
+            .SetOutOfBounds(OutOfBounds::Respawn);
         const Mesh capsule = Mesh::Capsule(0.35f, 0.5f);
         for (int i = 0; i < 4; ++i)
             World.Spawn()
@@ -47,7 +55,8 @@ public:
                 .SetPosition({5.0f + i * 0.9f, 1.0f + i * 1.5f, 2.0f})
                 .SetRotation(Quat::AxisAngle({0, 0, 1}, 0.4f * i))
                 .SetColor({0.3f, 0.7f, 0.9f})
-                .AddBody({BodyType::Dynamic, Shape::Capsule(0.35f, 0.5f), 1.0f});
+                .AddBody({BodyType::Dynamic, Shape::Capsule(0.35f, 0.5f), 1.0f})
+                .SetOutOfBounds(OutOfBounds::Respawn);
 
         // Триггер-зона: сообщает, когда в неё что-то влетает
         m_zone = World.Spawn()
@@ -139,6 +148,15 @@ public:
             if (Input.Pressed(Key::T)) {
                 Amper.SetShadows(!Amper.Shadows());
                 std::printf("[game] карты теней: %s\n", Amper.Shadows() ? "on" : "off");
+            }
+            if (Input.Pressed(Key::M)) {  // 1 -> 2 -> 4 -> 8 -> 1 (в пределах возможностей GPU)
+                uint32_t next = Amper.Antialiasing() * 2;
+                while (next <= Amper.MaxAntialiasing() && !Amper.AntialiasingSupported(next))
+                    next *= 2;  // бывают пропуски: например, только 1x и 4x
+                if (next > Amper.MaxAntialiasing())
+                    next = 1;
+                Amper.SetAntialiasing(next);
+                std::printf("[game] MSAA: %ux\n", next);
             }
             if (Input.Pressed(Key::Escape))
                 Engine::Quit();

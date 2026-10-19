@@ -91,14 +91,14 @@ void Gpu::Destroy(Buffer& b) {
 }
 
 Image Gpu::CreateImage2D(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                         uint32_t layers) {
+                         uint32_t layers, VkSampleCountFlagBits samples) {
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
     ii.extent = {extent.width, extent.height, 1};
     ii.mipLevels = 1;
     ii.arrayLayers = layers;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.samples = samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
 

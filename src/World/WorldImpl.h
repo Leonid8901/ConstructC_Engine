@@ -25,11 +25,26 @@ struct EntityData {
     uint32_t gen = 0;
     bool alive = false;
     bool visible = true;
+
+    // Границы мира
+    Vec3 home;
+    Quat homeRot;
+    bool hasHome = false;
+    bool homeExplicit = false;  // задана SetRespawnPoint — AddBody её не перезаписывает
+    bool moves = false;         // динамическое или кинематическое тело
+    OutOfBounds oob = OutOfBounds::Default;
 };
 
 enum class CmdType : uint8_t {
     Create, Destroy, SetPos, SetRot, SetScale, SetMesh, SetMaterial, SetColor, SetVisible,
-    AddBody, RemoveBody, SetVel, SetAngVel, AddForce, AddImpulse
+    AddBody, RemoveBody, SetVel, SetAngVel, AddForce, AddImpulse, SetOutOfBounds, SetHome
+};
+
+struct WorldBounds {
+    bool enabled = false;
+    Vec3 min{-3.0e38f, -3.0e38f, -3.0e38f};
+    Vec3 max{3.0e38f, 3.0e38f, 3.0e38f};
+    OutOfBounds action = OutOfBounds::Destroy;
 };
 
 struct Command {
@@ -63,6 +78,14 @@ public:
     Entity Spawn();
     void Submit(const Command& cmd);  // применить сразу или отложить
     void Flush();                     // главный поток, вне стадий
+    void EnforceBounds();             // главный поток, вне стадий, после физики
+
+    WorldBounds Bounds();
+    template <class Fn>
+    void EditBounds(Fn&& fn) {  // чтение-изменение-запись под одним локом
+        std::lock_guard lk(m_boundsMutex);
+        fn(m_bounds);
+    }
 
     EntityData& At(uint32_t index) { return m_pages[index >> kPageBits].load(std::memory_order_acquire)[index & (kPageSize - 1)]; }
     const EntityData* TryGet(uint32_t index, uint32_t gen) const;
@@ -86,6 +109,9 @@ private:
     uint32_t m_next = 0;
     std::vector<std::unique_ptr<CommandBuffer>> m_buffers;
     std::vector<Command> m_scratch;
+
+    std::mutex m_boundsMutex;
+    WorldBounds m_bounds;
 };
 
 } // namespace ce::core
