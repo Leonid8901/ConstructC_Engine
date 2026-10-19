@@ -32,6 +32,8 @@ layout(set = 0, binding = 0) uniform FrameData {
 
 layout(std430, set = 0, binding = 1) readonly buffer Instances { Instance instances[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Lights { PointLight lights[]; };
+// Индексы инстансов, прошедших отсечение: gl_InstanceIndex -> индекс в instances[]
+layout(std430, set = 0, binding = 5) readonly buffer DrawIndices { uint drawIndices[]; };
 
 vec3 Tonemap(vec3 c) {
     c *= frame.ambient.w;

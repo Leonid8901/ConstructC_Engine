@@ -58,6 +58,10 @@ Buffer Gpu::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, MemUsage m
     case MemUsage::Upload:
         ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
         break;
+    case MemUsage::Stream:
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        break;
     case MemUsage::Readback:
         ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
         break;

@@ -29,6 +29,20 @@ target_include_directories(CustomEngine
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator)
 
+# Профилирование через Tracy: cmake -DCE_PROFILE=ON (по умолчанию выключено и ничего не стоит)
+option(CE_PROFILE "Профилирование через Tracy" OFF)
+if(CE_PROFILE)
+    FetchContent_Declare(tracy
+        GIT_REPOSITORY https://github.com/wolfpld/tracy.git
+        GIT_TAG v0.11.1
+        GIT_SHALLOW TRUE)
+    # Данные собираются только пока подключён Tracy Profiler: без него память не растёт
+    set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(tracy)
+    target_link_libraries(CustomEngine PRIVATE TracyClient)
+    target_compile_definitions(CustomEngine PRIVATE CE_PROFILE=1)
+endif()
+
 if(MSVC)
     target_compile_options(CustomEngine PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(CustomEngine PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -70,4 +84,14 @@ if(MSVC)
     target_compile_options(Sandbox PRIVATE /W4 /utf-8)
 else()
     target_compile_options(Sandbox PRIVATE -Wall -Wextra)
+endif()
+
+# ---------------- Бенчмарки (cmake -DCE_BUILD_BENCH=ON) ----------------
+option(CE_BUILD_BENCH "Собрать бенчмарки UniXBench и SceneBench" OFF)
+if(CE_BUILD_BENCH)
+    add_executable(UniXBench bench/unix_bench.cpp)
+    target_include_directories(UniXBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)  # внутренний Scheduler
+    target_link_libraries(UniXBench PRIVATE CustomEngine)
+    add_executable(SceneBench bench/scene_bench.cpp)
+    target_link_libraries(SceneBench PRIVATE CustomEngine)
 endif()

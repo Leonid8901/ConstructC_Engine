@@ -13,6 +13,7 @@
 #include "Grave/Physics.h"
 #include "Platform/Input.h"
 #include "Platform/Window.h"
+#include "Profile.h"
 #include "UniX/GpuLanes.h"
 #include "UniX/Scheduler.h"
 #include "Vulkan/Gpu.h"
@@ -133,16 +134,23 @@ int Engine::Run(Game& game, const EngineConfig& cfg) {
 
             scheduler.BeginFrame(ec.time, dt, ec.frame);
             scheduler.RunStage(Stage::Update);
-            world.Flush();
+            {
+                CE_ZONE("World.Flush");
+                world.Flush();
+            }
             scheduler.RunStage(Stage::Simulate);
-            grave.DispatchEvents();
-            world.Flush();
+            {
+                CE_ZONE("Grave.Events + World.Flush");
+                grave.DispatchEvents();
+                world.Flush();
+            }
             scheduler.RunStage(Stage::Prepare);
 
             const auto r0 = clock::now();
             amper.Render();
             scheduler.AddMainWork(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - r0).count());
             scheduler.EndFrame();
+            CE_FRAME_MARK();
 
             ++frames;
             const float elapsed = std::chrono::duration<float>(now - titleTimer).count();
