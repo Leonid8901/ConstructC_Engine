@@ -13,7 +13,9 @@ class InputState;
 
 class Window {
 public:
-    Window(uint32_t width, uint32_t height, const std::string& title, InputState* input);
+    // platform: "auto" | "x11" | "wayland" | "win32" (engine.json). На Linux "auto" — Wayland, если сессия Wayland, иначе X11.
+    Window(uint32_t width, uint32_t height, const std::string& title, InputState* input,
+           const std::string& platform = "auto");
     ~Window();
 
     Window(const Window&) = delete;
@@ -26,6 +28,7 @@ public:
     void FramebufferSize(int& width, int& height) const;
     bool ConsumeResized();
     void SetCursorLocked(bool locked) const;
+    std::string PlatformName() const;
 
     VkSurfaceKHR CreateSurface(VkInstance instance) const;
     static std::vector<const char*> RequiredInstanceExtensions();

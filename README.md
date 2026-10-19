@@ -22,6 +22,7 @@
 - Рендер: PBR (GGX), инстансинг, reverse-Z, ACES, до 256 точечных источников. Отсечение по фрустуму камеры и по объёму каждого каскада теней. Сглаживание MSAA 1/2/4/8.
 - Тени от солнца: ray query (флаг) либо 4 каскада по 2048² с PCF 3×3.
 - Изменения мира из задач потокобезопасны без блокировок на стороне пользователя (отложенные команды).
+- Windows и Linux (X11 и Wayland). Определение CPU и GPU, профили по классу/вендору GPU, `engine.json` для игрока, fallback-и форматов под разные драйверы ([docs/Platforms.md](docs/Platforms.md)).
 
 ## Быстрый старт
 
@@ -65,7 +66,8 @@ int main() {
 Требования:
 
 - CMake ≥ 3.20, компилятор с C++20
-- Vulkan SDK (заголовки, loader, `glslc`); GPU и драйвер с Vulkan 1.3
+- Windows: Vulkan SDK (заголовки, loader, `glslc`). Linux: пакеты из [docs/Platforms.md](docs/Platforms.md#5-linux) (на Ubuntu одной командой `apt install`)
+- GPU и драйвер с Vulkan 1.3
 - GLFW 3.4 и Vulkan Memory Allocator 3.3.0 подтягиваются через `FetchContent`
 
 ```
@@ -82,7 +84,9 @@ Linux:
 ./build/Sandbox
 ```
 
-Шейдеры компилируются `glslc` при сборке. Движок ищет SPIR-V сначала в `shaders/` рядом с исполняемым файлом, затем в каталоге сборки (`SHADER_DIR`). Validation layers включаются в Debug автоматически, если установлен SDK.
+Шейдеры компилируются `glslc` при сборке. Движок ищет SPIR-V в `shaders/` рядом с исполняемым файлом, затем в текущей папке, затем в каталоге сборки (`SHADER_DIR`). `cmake --install build --prefix dist` собирает папку для раздачи (exe + `shaders/`). Validation layers включаются в Debug автоматически, если установлен SDK.
+
+При первом запуске рядом с exe появляется `engine.json`: по умолчанию всё `"auto"`, игрок может выбрать GPU, MSAA, RT, тени, число потоков, X11/Wayland. Что выбрал движок — в логе, строки `[CE] CPU/GPU/Настройки`.
 
 Ray tracing опционален: нужны расширения `VK_KHR_acceleration_structure` и `VK_KHR_ray_query`. При их отсутствии `Amper.RayTracingSupported()` возвращает `false`, `SetRayTracing(true)` ничего не включает.
 
@@ -131,7 +135,7 @@ src/
   Grave/                коллизии, решатель, острова
   Amper/                рендерер, реестр мешей, BLAS/TLAS, каскады теней
   Vulkan/               контекст, swapchain, обёртка VMA
-  Platform/             окно (GLFW), ввод
+  Platform/             окно (GLFW), ввод, определение железа, профили и engine.json
 shaders/                GLSL: mesh, mesh_rt, sky, shadow
 sandbox/                демонстрационная игра
 bench/                  UniXBench, SceneBench
@@ -145,6 +149,7 @@ docs/                   документация по подсистемам
 - [docs/Grave.md](docs/Grave.md) — формы, шаг симуляции, решатель, параметры
 - [docs/Amper.md](docs/Amper.md) — конвейер, модель освещения, тени
 - [docs/API.md](docs/API.md) — справочник по `World`, `Entity`, `Mesh`, `Camera`, `Input`, `Engine`, математике
+- [docs/Platforms.md](docs/Platforms.md) — Windows/Linux, определение железа, профили, `engine.json`, сборка на Linux
 
 ## Проверка
 
@@ -154,6 +159,7 @@ docs/                   документация по подсистемам
 
 - **UniX.** Кольца work stealing защищены мьютексами (по одному на кольцо), не lock-free. Зависимости между задачами выражены стадиями с барьерами (Update → Simulate → Prepare), графа зависимостей нет. Распределение работы по GPU-очередям минимально: compute-очередь используется для сборки BLAS, transfer — для загрузки мешей.
 - **Grave.** Нет CCD, шарниров, меш-коллайдеров. Высокие плотные стены (≈ 10×5 боксов) не всегда засыпают; для очень высоких стопок помогает `SetFixedRate(240)`.
+- **Платформы.** Windows и Linux (x86-64). macOS и Android не поддерживаются; ARM64 Linux собирается, но не проверялся. Нужен Vulkan 1.3: старые GPU (примерно до GTX 900 / RX 400 / Intel Skylake на Windows) получат понятную ошибку со списком причин.
 - **Amper.** Нет текстур и glTF (OBJ грузится). Тени точечных источников — только с RT. Освещение без кластеризации: фрагмент перебирает все источники. Отсечение — на CPU по сферам, без отсечения по перекрытию.
 
 ## Лицензия

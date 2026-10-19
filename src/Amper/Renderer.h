@@ -55,7 +55,7 @@ struct FrameUbo {
     Mat4 cascadeViewProj[4];  // свет -> клип для каждого каскада
     float cascadeSplits[4];   // дальняя граница каскада (глубина вдоль взгляда камеры)
     float cascadeTexel[4];    // размер текселя каскада в метрах (для normal offset)
-    Vec4 shadowParams;        // x = тени включены
+    Vec4 shadowParams;        // x = тени включены, y = кодировать sRGB в шейдере (swapchain UNORM)
 };
 
 class Renderer {
@@ -63,7 +63,6 @@ public:
     static constexpr uint32_t kFramesInFlight = 2;
     static constexpr uint32_t kMaxLights = 256;
     static constexpr uint32_t kCascades = 4;
-    static constexpr uint32_t kShadowSize = 2048;
 
     Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& window, const EngineConfig& config);
     ~Renderer();
@@ -175,7 +174,10 @@ private:
     std::unique_ptr<MeshRegistry> m_meshes;
     Image m_depth;
     Image m_msaaColor;  // только при m_samples > 1: рисуем в него, resolve — в изображение swapchain
-    static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+    VkFormat m_depthFormat = VK_FORMAT_D32_SFLOAT;   // D32 -> X8_D24 -> D16, что поддерживает GPU
+    VkFormat m_shadowFormat = VK_FORMAT_D32_SFLOAT;
+    bool m_shadowLinear = true;                       // линейная фильтрация глубины (бесплатный 2x2 PCF)
+    uint32_t m_shadowSize = 2048;
 
     // MSAA
     VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;

@@ -1,5 +1,6 @@
 #include "UniX/Scheduler.h"
 #include "Core.h"
+#include "Platform/Hardware.h"
 #include "Profile.h"
 
 #include <algorithm>
@@ -480,6 +481,7 @@ void Scheduler::WorkerLoop(uint32_t slot) {
 void Scheduler::BackgroundLoop(uint32_t slot) {
     t_slot = static_cast<int>(slot);
     CE_THREAD_NAME("UniX background");
+    LowerCurrentThreadPriority();  // на гибридных CPU ОС уведёт его на E-ядра, кадру не мешает
     while (true) {
         Job job;
         {

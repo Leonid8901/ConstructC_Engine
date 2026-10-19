@@ -1,6 +1,7 @@
 #include "Amper/Renderer.h"
 #include "Core.h"
 #include "Profile.h"
+#include "Platform/Hardware.h"
 #include "Platform/Window.h"
 #include "UniX/GpuLanes.h"
 #include "UniX/Scheduler.h"
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 namespace ce::core {
@@ -26,18 +28,27 @@ int64_t NowNs() {
 }
 
 VkShaderModule LoadShader(VkDevice device, const std::string& name) {
-    // Сначала рядом с exe (для раздачи игры), потом каталог сборки
-    std::string path = "shaders/" + name;
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        path = std::string(SHADER_DIR) + name;
-        file.open(path, std::ios::binary | std::ios::ate);
+    // Порядок: shaders/ рядом с exe (раздача игры, запуск из любой папки), shaders/ в текущей папке, каталог сборки
+    const std::filesystem::path candidates[] = {ExecutableDir() / "shaders" / name, std::filesystem::path("shaders") / name,
+                                                std::filesystem::path(SHADER_DIR) / name};
+    std::ifstream file;
+    std::filesystem::path path;
+    for (const auto& c : candidates) {
+        if (c.empty() || c == std::filesystem::path(name))
+            continue;
+        file.open(c, std::ios::binary | std::ios::ate);
+        if (file) {
+            path = c;
+            break;
+        }
+        file.clear();
     }
     if (!file)
-        throw std::runtime_error("Cannot open shader: " + name + " (shaders/ рядом с exe или " + SHADER_DIR + ")");
+        throw std::runtime_error("Не найден шейдер " + name + ": положите папку shaders/ рядом с exe (ищу и в " +
+                                 std::string(SHADER_DIR) + ")");
     size_t size = static_cast<size_t>(file.tellg());
     if (size == 0 || size % 4 != 0)
-        throw std::runtime_error("Invalid SPIR-V: " + path);
+        throw std::runtime_error("Повреждён SPIR-V: " + path.string());
     std::vector<uint32_t> code(size / 4);
     file.seekg(0);
     file.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(size));
@@ -91,6 +102,40 @@ Renderer::Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& 
     m_swapchain = std::make_unique<Swapchain>(ctx, window, config.vsync);
     m_meshes = std::make_unique<MeshRegistry>(gpu, lanes);
 
+    // Форматы глубины: D32 есть почти везде на ПК; спецификация гарантирует D16 и один из X8_D24/D32
+    auto supports = [&](VkFormat f, VkFormatFeatureFlags need) {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(ctx.PhysicalDevice(), f, &p);
+        return (p.optimalTilingFeatures & need) == need;
+    };
+    const VkFormat depthCandidates[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM};
+    for (VkFormat f : depthCandidates)
+        if (supports(f, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            m_depthFormat = f;
+            break;
+        }
+    bool shadowFound = false;
+    for (bool linear : {true, false}) {
+        for (VkFormat f : depthCandidates) {
+            VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            if (linear)
+                need |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+            if (supports(f, need)) {
+                m_shadowFormat = f;
+                m_shadowLinear = linear;
+                shadowFound = true;
+                break;
+            }
+        }
+        if (shadowFound)
+            break;
+    }
+    m_shadowSize = std::clamp(config.shadowMapSize ? config.shadowMapSize : 2048u, 256u,
+                              std::min(8192u, ctx.Properties().limits.maxImageDimension2D));
+    if (m_depthFormat != VK_FORMAT_D32_SFLOAT || m_shadowFormat != VK_FORMAT_D32_SFLOAT || !m_shadowLinear)
+        Log("Amper: глубина " + std::to_string(m_depthFormat) + ", тени " + std::to_string(m_shadowFormat) +
+            (m_shadowLinear ? "" : " (без линейной фильтрации)"));
+
     // Поддерживаемые числа сэмплов: общие для лимитов устройства и обоих форматов целей (бывают «дырявые» наборы, например 1 и 4)
     VkSampleCountFlags counts = ctx.Properties().limits.framebufferColorSampleCounts &
                                 ctx.Properties().limits.framebufferDepthSampleCounts;
@@ -101,7 +146,7 @@ Renderer::Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& 
             return VkSampleCountFlags(VK_SAMPLE_COUNT_1_BIT);
         return props.sampleCounts;
     };
-    counts &= formatCounts(kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    counts &= formatCounts(m_depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     counts &= formatCounts(m_swapchain->Format(),
                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
     m_sampleMask = (counts & 0xF) | VK_SAMPLE_COUNT_1_BIT;  // 1/2/4/8
@@ -169,7 +214,7 @@ void Renderer::CreateTargets() {
     m_gpu.Destroy(m_depth);
     m_gpu.Destroy(m_msaaColor);
     const VkExtent2D extent = m_swapchain->Extent();
-    m_depth = m_gpu.CreateImage2D(extent, kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    m_depth = m_gpu.CreateImage2D(extent, m_depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                   VK_IMAGE_ASPECT_DEPTH_BIT, 1, m_samples);
     if (m_samples != VK_SAMPLE_COUNT_1_BIT)
         m_msaaColor = m_gpu.CreateImage2D(extent, m_swapchain->Format(),
@@ -191,22 +236,22 @@ void Renderer::ApplySampleChange() {
 }
 
 void Renderer::CreateShadowResources() {
-    m_shadowMap = m_gpu.CreateImage2D({kShadowSize, kShadowSize}, kDepthFormat,
+    m_shadowMap = m_gpu.CreateImage2D({m_shadowSize, m_shadowSize}, m_shadowFormat,
                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                       VK_IMAGE_ASPECT_DEPTH_BIT, kCascades);
     for (uint32_t c = 0; c < kCascades; ++c) {
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = m_shadowMap.image;
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = kDepthFormat;
+        vi.format = m_shadowFormat;
         vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, c, 1};
         VK_CHECK(vkCreateImageView(m_device, &vi, nullptr, &m_shadowLayerViews[c]));
     }
 
     // Аппаратное сравнение глубины + билинейная фильтрация = бесплатный 2x2 PCF на каждый тап
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    si.magFilter = VK_FILTER_LINEAR;
-    si.minFilter = VK_FILTER_LINEAR;
+    si.magFilter = m_shadowLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    si.minFilter = si.magFilter;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;  // за краем карты — освещено
     si.compareEnable = VK_TRUE;
@@ -450,7 +495,7 @@ void Renderer::CreatePipelines() {
         VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         ri.colorAttachmentCount = shadow ? 0 : 1;
         ri.pColorAttachmentFormats = shadow ? nullptr : &m_colorFormat;
-        ri.depthAttachmentFormat = kDepthFormat;
+        ri.depthAttachmentFormat = shadow ? m_shadowFormat : m_depthFormat;
 
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pi.pNext = &ri;
@@ -576,7 +621,7 @@ void Renderer::ComputeCascades(FrameUbo& ubo, ShadowCull& cull, Vec3 camPos, Vec
             r = std::max(r, Length(p - center));
         r = std::ceil(r * 16.0f) / 16.0f;
 
-        float texel = 2.0f * r / kShadowSize;
+        float texel = 2.0f * r / static_cast<float>(m_shadowSize);
         Vec3 cl = lightRot.TransformPoint(center);
         cl.x = std::floor(cl.x / texel) * texel;
         cl.y = std::floor(cl.y / texel) * texel;
@@ -598,8 +643,8 @@ void Renderer::RecordShadowPass(Frame& f) {
                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
                  kCascades);
 
-    VkViewport viewport{0, 0, static_cast<float>(kShadowSize), static_cast<float>(kShadowSize), 0, 1};
-    VkRect2D scissor{{0, 0}, {kShadowSize, kShadowSize}};
+    VkViewport viewport{0, 0, static_cast<float>(m_shadowSize), static_cast<float>(m_shadowSize), 0, 1};
+    VkRect2D scissor{{0, 0}, {m_shadowSize, m_shadowSize}};
     for (uint32_t c = 0; c < kCascades; ++c) {
         VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         depth.imageView = m_shadowLayerViews[c];
@@ -746,7 +791,7 @@ void Renderer::Prepare(Task& task) {
         ubo.skyHorizon = {m_skyHorizon, 0};
         if (f.shadows)
             ComputeCascades(ubo, cull, camPos, fwd, right, up, tanV, aspect, m_sunDir, m_shadowDistance);
-        ubo.shadowParams = {f.shadows ? 1.0f : 0.0f, 0, 0, 0};
+        ubo.shadowParams = {f.shadows ? 1.0f : 0.0f, m_swapchain->ManualSrgb() ? 1.0f : 0.0f, 0, 0};
         auto* lights = static_cast<GpuLight*>(f.lights.mapped);
         uint32_t n = 0;
         for (const LightSlot& s : m_lights)

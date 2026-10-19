@@ -11,7 +11,9 @@
 #include "CE/Input.h"
 #include "Core.h"
 #include "Grave/Physics.h"
+#include "Platform/Hardware.h"
 #include "Platform/Input.h"
+#include "Platform/Settings.h"
 #include "Platform/Window.h"
 #include "Profile.h"
 #include "UniX/GpuLanes.h"
@@ -22,6 +24,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 
@@ -54,7 +57,7 @@ void Log(const std::string& message) {
 
 } // namespace core
 
-int Engine::Run(Game& game, const EngineConfig& cfg) {
+int Engine::Run(Game& game, const EngineConfig& requested) {
     using namespace core;
     if (CorePtr()) {
         Log("Engine::Run: движок уже запущен");
@@ -65,11 +68,63 @@ int Engine::Run(Game& game, const EngineConfig& cfg) {
 #endif
     try {
         EngineCore ec;
-        ec.config = cfg;
+
+        // engine.json рядом с exe (путь в UTF-8 -> path: на Windows ANSI сломал бы кириллицу)
+        UserConfig user;
+        if (!requested.configFile.empty()) {
+            std::filesystem::path path(reinterpret_cast<const char8_t*>(requested.configFile.c_str()));
+            if (path.is_relative()) {
+                const std::filesystem::path dir = ExecutableDir();
+                if (!dir.empty())
+                    path = dir / path;
+            }
+            user = LoadUserConfig(path, true);
+        }
+        CpuInfo cpu = DetectCpu();
 
         InputState input;
-        Window window(cfg.width, cfg.height, cfg.title, &input);
-        VulkanContext vk(window);
+        Window window(requested.width, requested.height, requested.title, &input, user.windowPlatform);
+        VulkanContext vk(window, user.gpuDevice);
+        GpuInfo gpuInfo = vk.Info();
+        ApplyManualHardware(user, cpu, gpuInfo);
+        const RuntimeSettings settings = ResolveSettings(requested, cpu, gpuInfo, user);
+
+        EngineConfig cfg = requested;
+        cfg.workerThreads = settings.workerThreads;
+        cfg.vsync = settings.vsync;
+        cfg.rayTracing = settings.rayTracing;
+        cfg.msaa = settings.msaa;
+        cfg.shadowMapSize = settings.shadowMapSize;
+        ec.config = cfg;
+
+        Log("CPU: " + Describe(cpu));
+        Log("GPU: " + Describe(gpuInfo));
+        Log("Окно: " + window.PlatformName() + (user.loaded ? " | engine.json прочитан" : "") +
+            (user.loaded && !user.autoDetect ? " (auto = false: железо из файла)" : ""));
+        Log("Настройки: " + Describe(settings));
+
+        SystemInfo& si = ec.system;
+#ifdef _WIN32
+        si.os = "Windows";
+#elif defined(__linux__)
+        si.os = "Linux";
+#else
+        si.os = "unknown";
+#endif
+        si.windowPlatform = window.PlatformName();
+        si.cpuVendor = cpu.vendor;
+        si.cpuName = cpu.brand;
+        si.cpuCores = cpu.physical;
+        si.cpuThreads = cpu.logical;
+        si.cpuHybrid = cpu.hybrid;
+        si.gpuVendor = gpuInfo.vendor;
+        si.gpuName = gpuInfo.name;
+        si.gpuType = ToString(gpuInfo.type);
+        si.gpuDriver = gpuInfo.driver;
+        si.gpuMemoryMB = gpuInfo.vram >> 20;
+        si.profile = settings.profile;
+        si.configLoaded = user.loaded;
+
         Gpu gpu(vk);
         GpuLanes lanes(vk);
         const uint32_t workers = Scheduler::ResolveWorkerCount(cfg.workerThreads);
@@ -77,6 +132,8 @@ int Engine::Run(Game& game, const EngineConfig& cfg) {
         Physics grave;
         CameraState camera;
         Renderer amper(vk, gpu, lanes, window, cfg);
+        amper.SetShadows(settings.shadows);
+        amper.SetShadowDistance(settings.shadowDistance);
 
         ec.input = &input;
         ec.window = &window;
@@ -174,6 +231,7 @@ int Engine::Run(Game& game, const EngineConfig& cfg) {
         return 0;
     } catch (const std::exception& e) {
         Log(std::string("Fatal: ") + e.what());
+        ShowFatalError("CustomEngine", e.what());  // на Windows игрок без консоли увидит окно с причиной
         return 1;
     }
 }
@@ -185,6 +243,7 @@ void Engine::Quit() {
 double Engine::Time() { return core::Core().time; }
 float Engine::DeltaTime() { return core::Core().dt; }
 uint64_t Engine::Frame() { return core::Core().frame; }
+const SystemInfo& Engine::System() { return core::Core().system; }
 
 // ---------------- Input ----------------
 

@@ -9,12 +9,33 @@ namespace ce::core {
 
 namespace {
 
+bool IsSrgb(VkFormat f) {
+    return f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+}
+
+// Порядок: sRGB-форматы (GPU сам кодирует гамму) -> 8-битные UNORM (гамму кодирует шейдер) -> что дали.
+// Только SDR (SRGB_NONLINEAR): HDR-пространства без тонмаппинга под них дали бы неверные цвета.
 VkSurfaceFormatKHR ChooseFormat(const std::vector<VkSurfaceFormatKHR>& formats) {
-    for (VkFormat want : {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB})
+    if (formats.size() == 1 && formats[0].format == VK_FORMAT_UNDEFINED)  // «любой» (старые драйверы)
+        return {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    for (VkFormat want : {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A8B8G8R8_SRGB_PACK32,
+                          VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+                          VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32})
         for (const auto& f : formats)
             if (f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
                 return f;
+    for (const auto& f : formats)
+        if (f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            return f;
     return formats[0];
+}
+
+VkCompositeAlphaFlagBitsKHR ChooseAlpha(VkCompositeAlphaFlagsKHR supported) {
+    for (auto a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                   VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+        if (supported & a)
+            return a;
+    return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
 VkPresentModeKHR ChoosePresentMode(const std::vector<VkPresentModeKHR>& modes, bool vsync) {
@@ -79,6 +100,9 @@ void Swapchain::Create(VkSwapchainKHR oldSwapchain) {
         m_extent.height = std::clamp(static_cast<uint32_t>(h), caps.minImageExtent.height, caps.maxImageExtent.height);
     }
 
+    if (m_extent.width == 0 || m_extent.height == 0)  // Wayland до первого кадра / свёрнутое окно
+        m_extent = {std::max(1u, m_extent.width), std::max(1u, m_extent.height)};
+
     uint32_t imageCount = caps.minImageCount + 1;
     if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount)
         imageCount = caps.maxImageCount;
@@ -92,7 +116,7 @@ void Swapchain::Create(VkSwapchainKHR oldSwapchain) {
     info.imageArrayLayers = 1;
     info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     info.preTransform = caps.currentTransform;
-    info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    info.compositeAlpha = ChooseAlpha(caps.supportedCompositeAlpha);  // OPAQUE есть не везде (часть Wayland/Android)
     info.presentMode = ChoosePresentMode(modes, m_vsync);
     info.clipped = VK_TRUE;
     info.oldSwapchain = oldSwapchain;
@@ -109,6 +133,7 @@ void Swapchain::Create(VkSwapchainKHR oldSwapchain) {
 
     VK_CHECK(vkCreateSwapchainKHR(m_ctx.Device(), &info, nullptr, &m_swapchain));
     m_format = format.format;
+    m_manualSrgb = !IsSrgb(m_format);
 
     vkGetSwapchainImagesKHR(m_ctx.Device(), m_swapchain, &count, nullptr);
     m_images.resize(count);

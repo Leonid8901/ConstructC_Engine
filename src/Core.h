@@ -34,7 +34,8 @@ struct EngineCore {
     Physics* grave = nullptr;
     Renderer* amper = nullptr;
     CameraState* camera = nullptr;
-    EngineConfig config;
+    EngineConfig config;  // итоговая: после профиля железа и engine.json
+    SystemInfo system;
     std::atomic<bool> quit{false};
     double time = 0;
     float dt = 0;

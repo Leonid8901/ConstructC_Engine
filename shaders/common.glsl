@@ -37,5 +37,11 @@ layout(std430, set = 0, binding = 5) readonly buffer DrawIndices { uint drawIndi
 
 vec3 Tonemap(vec3 c) {
     c *= frame.ambient.w;
-    return clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);  // ACES (Narkowicz)
+    c = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);  // ACES (Narkowicz)
+    if (frame.shadowParams.y > 0.5) {  // swapchain UNORM: кодируем sRGB сами (обычно это делает формат *_SRGB)
+        vec3 lo = c * 12.92;
+        vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+        c = mix(hi, lo, lessThanEqual(c, vec3(0.0031308)));
+    }
+    return c;
 }
