@@ -24,6 +24,7 @@ struct EngineConfig {
     bool     rayTracing = false;    // начальное значение флага RT
     float    targetFps = 60.0f;     // бюджет кадра для UniX
     uint32_t workerThreads = 0;     // 0 — авто: ядра − 2 (минимум 1)
+    uint32_t msaa = 4;              // сглаживание: 1 (выкл), 2, 4, 8; урезается до возможностей GPU
 };
 
 class Game {
@@ -50,6 +51,33 @@ public:
 ```cpp
 World.Spawn()    // Entity: создать сущность
 World.Count()    // uint32_t: число живых сущностей
+```
+
+### Область мира (KillZ)
+
+| Метод `World` | Описание |
+|---|---|
+| `SetBounds(Vec3 min, Vec3 max)` | включить область мира: параллелепипед |
+| `SetKillY(float y)` | включить только нижнюю границу по Y (аналог KillZ в Unreal; у нас Y вверх) |
+| `ClearBounds()` | выключить область |
+| `SetOutOfBoundsAction(OutOfBounds)` | действие по умолчанию: `Destroy` (по умолчанию), `Respawn` или `None` |
+
+Раз в кадр, после физики (на главном потоке), проверяется позиция (центр) каждой сущности. Действие для сущности:
+
+| Флаг сущности (`Entity::SetOutOfBounds`) | Что происходит за границей |
+|---|---|
+| `Default` (не задан) | для динамических и кинематических тел — действие по умолчанию; сущности без тела и статические тела не трогаются |
+| `None` | ничего |
+| `Destroy` | сущность удаляется (`Entity::Valid()` → `false`) |
+| `Respawn` | позиция и поворот — из точки возврата, линейная и угловая скорости обнуляются, тело будится |
+
+Точка возврата по умолчанию — положение и поворот сущности в момент `AddBody` (или в момент `SetOutOfBounds(Respawn)`, если тела нет). Задать явно: `Entity::SetRespawnPoint(Vec3 position, Quat rotation = {})`; явную точку `AddBody` не перезаписывает.
+
+```cpp
+World.SetBounds({-45, -20, -45}, {45, 100, 45});      // шары, улетевшие за пол, удаляются
+World.Spawn().SetMesh(Mesh::Cube()).SetPosition({0, 0.5f, 0})
+    .AddBody({BodyType::Dynamic, Shape::Box({0.5f, 0.5f, 0.5f})})
+    .SetOutOfBounds(OutOfBounds::Respawn);              // а этот куб вернётся на место
 ```
 
 `Spawn` возвращает дескриптор немедленно. Из задач сама сущность появляется при ближайшем Flush ([Architecture.md](Architecture.md#4-мир-и-отложенные-команды)).
@@ -83,6 +111,8 @@ World.Count()    // uint32_t: число живых сущностей
 | `SetMaterial(const Material&)` | материал целиком |
 | `SetColor(Vec3)` | только цвет материала |
 | `SetVisible(bool)` | показ/скрытие |
+| `SetOutOfBounds(OutOfBounds)` | поведение за областью мира (см. [World](#область-мира-killz)) |
+| `SetRespawnPoint(Vec3, Quat = {})` | точка возврата для `Respawn` |
 
 ### Физика
 

@@ -90,7 +90,31 @@ Renderer::Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& 
     m_rtEnabled.store(config.rayTracing && m_rtSupported);
     m_swapchain = std::make_unique<Swapchain>(ctx, window, config.vsync);
     m_meshes = std::make_unique<MeshRegistry>(gpu, lanes);
-    CreateDepth();
+
+    // Поддерживаемые числа сэмплов: общие для лимитов устройства и обоих форматов целей (бывают «дырявые» наборы, например 1 и 4)
+    VkSampleCountFlags counts = ctx.Properties().limits.framebufferColorSampleCounts &
+                                ctx.Properties().limits.framebufferDepthSampleCounts;
+    auto formatCounts = [&](VkFormat format, VkImageUsageFlags usage) {
+        VkImageFormatProperties props{};
+        if (vkGetPhysicalDeviceImageFormatProperties(ctx.PhysicalDevice(), format, VK_IMAGE_TYPE_2D,
+                                                     VK_IMAGE_TILING_OPTIMAL, usage, 0, &props) != VK_SUCCESS)
+            return VkSampleCountFlags(VK_SAMPLE_COUNT_1_BIT);
+        return props.sampleCounts;
+    };
+    counts &= formatCounts(kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    counts &= formatCounts(m_swapchain->Format(),
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+    m_sampleMask = (counts & 0xF) | VK_SAMPLE_COUNT_1_BIT;  // 1/2/4/8
+    for (uint32_t s = 8; s >= 1; s /= 2)
+        if (m_sampleMask & s) {
+            m_maxSamples = s;
+            break;
+        }
+    m_requestedSamples.store(config.msaa);
+    m_samples = PickSamples(config.msaa);
+    m_appliedSamples.store(static_cast<uint32_t>(m_samples));
+    Log("Amper MSAA: " + std::to_string(static_cast<uint32_t>(m_samples)) + "x (max " + std::to_string(m_maxSamples) + "x)");
+    CreateTargets();
     CreateShadowResources();
     CreateDescriptors();
     CreateFrames();
@@ -115,12 +139,7 @@ Renderer::~Renderer() {
         m_gpu.Destroy(f.scratch);
     }
     DestroyRenderFinished();
-    vkDestroyPipeline(m_device, m_skyPipeline, nullptr);
-    vkDestroyPipeline(m_device, m_meshPipeline, nullptr);
-    vkDestroyPipeline(m_device, m_shadowPipeline, nullptr);
-    if (m_meshRtPipeline)
-        vkDestroyPipeline(m_device, m_meshRtPipeline, nullptr);
-    vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+    DestroyPipelines();
     for (VkImageView v : m_shadowLayerViews)
         vkDestroyImageView(m_device, v, nullptr);
     vkDestroySampler(m_device, m_shadowSampler, nullptr);
@@ -128,16 +147,47 @@ Renderer::~Renderer() {
     vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
     vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
     m_gpu.Destroy(m_depth);
+    m_gpu.Destroy(m_msaaColor);
     m_meshes.reset();
     m_swapchain.reset();
 }
 
 // ---------------- создание ресурсов ----------------
 
-void Renderer::CreateDepth() {
+// Наибольшее поддерживаемое число сэмплов, не превышающее запрошенное
+VkSampleCountFlagBits Renderer::PickSamples(uint32_t requested) const {
+    uint32_t best = 1;
+    for (uint32_t s = 2; s <= 8; s *= 2)
+        if (s <= requested && (m_sampleMask & s))
+            best = s;
+    return static_cast<VkSampleCountFlagBits>(best);
+}
+
+// Цели основного прохода. При MSAA глубина тоже мультисэмпловая; цвет — временный (transient):
+// после resolve в swapchain он не нужен, на тайловых GPU может вообще не попасть в память.
+void Renderer::CreateTargets() {
     m_gpu.Destroy(m_depth);
-    m_depth = m_gpu.CreateImage2D(m_swapchain->Extent(), kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                                  VK_IMAGE_ASPECT_DEPTH_BIT);
+    m_gpu.Destroy(m_msaaColor);
+    const VkExtent2D extent = m_swapchain->Extent();
+    m_depth = m_gpu.CreateImage2D(extent, kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                  VK_IMAGE_ASPECT_DEPTH_BIT, 1, m_samples);
+    if (m_samples != VK_SAMPLE_COUNT_1_BIT)
+        m_msaaColor = m_gpu.CreateImage2D(extent, m_swapchain->Format(),
+                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                                          VK_IMAGE_ASPECT_COLOR_BIT, 1, m_samples);
+}
+
+void Renderer::ApplySampleChange() {
+    const VkSampleCountFlagBits want = PickSamples(m_requestedSamples.load());
+    if (want == m_samples)
+        return;
+    vkDeviceWaitIdle(m_device);
+    m_samples = want;
+    m_appliedSamples.store(static_cast<uint32_t>(want));
+    CreateTargets();
+    DestroyPipelines();
+    CreatePipelines();
+    Log("Amper MSAA: " + std::to_string(static_cast<uint32_t>(want)) + "x");
 }
 
 void Renderer::CreateShadowResources() {
@@ -383,7 +433,7 @@ void Renderer::CreatePipelines() {
             rs.depthBiasSlopeFactor = 1.75f;
         }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        ms.rasterizationSamples = shadow ? VK_SAMPLE_COUNT_1_BIT : m_samples;  // карты теней без MSAA
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.depthTestEnable = mesh ? VK_TRUE : VK_FALSE;
         ds.depthWriteEnable = mesh ? VK_TRUE : VK_FALSE;
@@ -431,6 +481,17 @@ void Renderer::CreatePipelines() {
         m_meshRtPipeline = build("mesh.vert.spv", "mesh_rt.frag.spv", true);
 }
 
+void Renderer::DestroyPipelines() {
+    vkDestroyPipeline(m_device, m_skyPipeline, nullptr);
+    vkDestroyPipeline(m_device, m_meshPipeline, nullptr);
+    vkDestroyPipeline(m_device, m_shadowPipeline, nullptr);
+    if (m_meshRtPipeline)
+        vkDestroyPipeline(m_device, m_meshRtPipeline, nullptr);
+    vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+    m_skyPipeline = m_meshPipeline = m_shadowPipeline = m_meshRtPipeline = VK_NULL_HANDLE;
+    m_pipelineLayout = VK_NULL_HANDLE;
+}
+
 void Renderer::CreateRenderFinished() {
     VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     m_renderFinished.resize(m_swapchain->ImageCount());
@@ -448,15 +509,9 @@ void Renderer::HandleResize() {
     m_swapchain->Recreate();  // внутри vkDeviceWaitIdle
     DestroyRenderFinished();
     CreateRenderFinished();
-    CreateDepth();
+    CreateTargets();
     if (m_swapchain->Format() != m_colorFormat) {
-        vkDestroyPipeline(m_device, m_skyPipeline, nullptr);
-        vkDestroyPipeline(m_device, m_meshPipeline, nullptr);
-        vkDestroyPipeline(m_device, m_shadowPipeline, nullptr);
-        if (m_meshRtPipeline)
-            vkDestroyPipeline(m_device, m_meshRtPipeline, nullptr);
-        vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-        m_meshRtPipeline = VK_NULL_HANDLE;
+        DestroyPipelines();
         CreatePipelines();
     }
 }
@@ -862,12 +917,27 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+    const bool msaa = m_samples != VK_SAMPLE_COUNT_1_BIT;
+    if (msaa)  // общий для кадров в полёте: ждём запись прошлого кадра
+        ImageBarrier(cmd, m_msaaColor.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView = m_swapchain->View(imageIndex);
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // небо закрашивает весь экран
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (msaa) {
+        // Рисуем в мультисэмпловый цвет, в конце прохода GPU усредняет сэмплы в изображение swapchain
+        color.imageView = m_msaaColor.view;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color.resolveImageView = m_swapchain->View(imageIndex);
+        color.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    } else {
+        color.imageView = m_swapchain->View(imageIndex);
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     depth.imageView = m_depth.view;
     depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
@@ -909,6 +979,7 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
 
 void Renderer::Render() {
     CE_ZONE("Amper.Render");
+    ApplySampleChange();
     Frame& f = m_frames[m_frameIndex];
 
     uint32_t imageIndex = 0;

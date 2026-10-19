@@ -116,6 +116,7 @@ uint32_t Physics::AddBody(const BodyDesc& d, Vec3 pos, Quat rot, uint32_t entity
     b.aabb = ComputeAabb(b);
     m_bodies.push_back(b);
     m_topologyDirty = true;
+    m_rayValid = false;
     return static_cast<uint32_t>(m_bodies.size() - 1);
 }
 
@@ -131,6 +132,7 @@ uint32_t Physics::RemoveBody(uint32_t index) {
     }
     m_bodies.pop_back();
     m_topologyDirty = true;
+    m_rayValid = false;
     m_cache.clear();  // индексы тел сдвинулись — старый кэш недействителен
     m_triggerPairs.clear();
     return moved;
@@ -148,6 +150,7 @@ void Physics::Wake(Body& b) {
         Body& b = m_bodies[i];                        \
         Body_;                                        \
         Wake(b);                                      \
+        m_rayValid = false;                           \
     }
 
 CE_BODY_OP(SetPosition, Vec3, { b.pos = val; b.aabb = ComputeAabb(b); })
@@ -202,6 +205,7 @@ void Physics::Step(Task& task, float frameDt) {
         m_accum = 0;  // защита от «спирали смерти»
     if (steps == 0)
         return;
+    m_rayValid = false;
 
     // Запись результата в мир (в стадии Simulate никто другой мир не пишет)
     WorldImpl& world = *Core().world;
@@ -654,35 +658,107 @@ void Physics::DispatchEvents() {
     }
 }
 
-bool Physics::Raycast(Vec3 origin, Vec3 dir, float maxDist, RaycastHit& hit, uint32_t mask) const {
-    std::shared_lock lk(m_lock);
-    dir = Normalize(dir);
-    if (LengthSq(dir) == 0)
-        return false;
-    float best = maxDist;
-    const Body* bestBody = nullptr;
-    Vec3 bestN;
+// ---------------- лучи ----------------
+
+namespace {
+
+// Slab test: пересекает ли луч AABB на отрезке [0, tMax]; tEnter — точка входа
+inline bool RayBox(const Aabb& box, Vec3 o, Vec3 d, Vec3 inv, float tMax, float& tEnter) {
+    float tmin = 0, tmax = tMax;
+    for (int a = 0; a < 3; ++a) {
+        if (std::fabs(d[a]) < 1e-8f) {
+            if (o[a] < box.min[a] || o[a] > box.max[a])
+                return false;
+            continue;
+        }
+        float t1 = (box.min[a] - o[a]) * inv[a], t2 = (box.max[a] - o[a]) * inv[a];
+        if (t1 > t2) std::swap(t1, t2);
+        tmin = std::max(tmin, t1);
+        tmax = std::min(tmax, t2);
+        if (tmin > tmax)
+            return false;
+    }
+    tEnter = tmin;
+    return true;
+}
+
+inline Vec3 Center(const Aabb& b) { return (b.min + b.max) * 0.5f; }
+
+} // namespace
+
+void Physics::RefreshQueries() {
+    std::unique_lock lk(m_lock);
+    if (m_rayValid)
+        return;
+    CE_ZONE("Grave.RayTree");
+    BuildRayTree();
+}
+
+void Physics::BuildRayTree() {
+    m_rayItems.clear();
+    m_rayPlanes.clear();
+    m_rayNodes.clear();
+    for (uint32_t i = 0; i < m_bodies.size(); ++i) {
+        Body& b = m_bodies[i];
+        if (b.Plane()) {
+            m_rayPlanes.push_back(i);
+            continue;
+        }
+        b.aabb = ComputeAabb(b);  // после интеграции позиций AABB отстаёт на подшаг — обновляем
+        m_rayItems.push_back(i);
+    }
+    if (!m_rayItems.empty()) {
+        m_rayNodes.reserve(m_rayItems.size() * 2);
+        m_rayNodes.emplace_back();
+        BuildRayNode(0, 0, static_cast<uint32_t>(m_rayItems.size()));
+    }
+    m_rayValid = true;
+}
+
+// Медианное разбиение по самой длинной оси центров; листья до 4 тел. Дети узла лежат парой подряд.
+void Physics::BuildRayNode(uint32_t node, uint32_t begin, uint32_t end) {
+    Aabb box = m_bodies[m_rayItems[begin]].aabb;
+    Vec3 cmin = Center(box), cmax = cmin;
+    for (uint32_t i = begin + 1; i < end; ++i) {
+        const Aabb& b = m_bodies[m_rayItems[i]].aabb;
+        box.min = Min(box.min, b.min);
+        box.max = Max(box.max, b.max);
+        const Vec3 c = Center(b);
+        cmin = Min(cmin, c);
+        cmax = Max(cmax, c);
+    }
+    m_rayNodes[node].box = box;
+    if (end - begin <= 4) {
+        m_rayNodes[node].first = begin;
+        m_rayNodes[node].count = end - begin;
+        return;
+    }
+    const Vec3 ext = cmax - cmin;
+    const int axis = ext.x > ext.y ? (ext.x > ext.z ? 0 : 2) : (ext.y > ext.z ? 1 : 2);
+    const uint32_t mid = begin + (end - begin) / 2;
+    std::nth_element(m_rayItems.begin() + begin, m_rayItems.begin() + mid, m_rayItems.begin() + end,
+                     [&](uint32_t a, uint32_t b) {
+                         return Center(m_bodies[a].aabb)[axis] < Center(m_bodies[b].aabb)[axis];
+                     });
+    const uint32_t left = static_cast<uint32_t>(m_rayNodes.size());
+    m_rayNodes.emplace_back();
+    m_rayNodes.emplace_back();
+    m_rayNodes[node].first = left;
+    m_rayNodes[node].count = 0;
+    BuildRayNode(left, begin, mid);
+    BuildRayNode(left + 1, mid, end);
+}
+
+bool Physics::RaycastLinear(Vec3 origin, Vec3 dir, float, uint32_t mask, float& best, const Body*& bestBody,
+                            Vec3& bestN) const {
+    const Vec3 inv{1.0f / (std::fabs(dir.x) < 1e-8f ? 1.0f : dir.x), 1.0f / (std::fabs(dir.y) < 1e-8f ? 1.0f : dir.y),
+                   1.0f / (std::fabs(dir.z) < 1e-8f ? 1.0f : dir.z)};
     for (const Body& b : m_bodies) {
         if (b.trigger || !(b.layer & mask))
             continue;
-        if (!b.Plane()) {  // быстрый отсев по AABB (slab test)
-            float tmin = 0, tmax = best;
-            bool miss = false;
-            for (int a = 0; a < 3 && !miss; ++a) {
-                if (std::fabs(dir[a]) < 1e-8f) {
-                    miss = origin[a] < b.aabb.min[a] || origin[a] > b.aabb.max[a];
-                    continue;
-                }
-                float inv = 1.0f / dir[a];
-                float t1 = (b.aabb.min[a] - origin[a]) * inv, t2 = (b.aabb.max[a] - origin[a]) * inv;
-                if (t1 > t2) std::swap(t1, t2);
-                tmin = std::max(tmin, t1);
-                tmax = std::min(tmax, t2);
-                miss = tmin > tmax;
-            }
-            if (miss)
-                continue;
-        }
+        float enter;
+        if (!b.Plane() && !RayBox(b.aabb, origin, dir, inv, best, enter))
+            continue;
         float t;
         Vec3 nrm;
         if (RaycastBody(b, origin, dir, best, t, nrm) && t <= best) {
@@ -691,7 +767,74 @@ bool Physics::Raycast(Vec3 origin, Vec3 dir, float maxDist, RaycastHit& hit, uin
             bestN = nrm;
         }
     }
-    if (!bestBody)
+    return bestBody != nullptr;
+}
+
+bool Physics::RaycastTree(Vec3 origin, Vec3 dir, float, uint32_t mask, float& best, const Body*& bestBody,
+                          Vec3& bestN) const {
+    const Vec3 inv{1.0f / (std::fabs(dir.x) < 1e-8f ? 1.0f : dir.x), 1.0f / (std::fabs(dir.y) < 1e-8f ? 1.0f : dir.y),
+                   1.0f / (std::fabs(dir.z) < 1e-8f ? 1.0f : dir.z)};
+    auto test = [&](uint32_t bi) {
+        const Body& b = m_bodies[bi];
+        if (b.trigger || !(b.layer & mask))
+            return;
+        float t;
+        Vec3 nrm;
+        if (RaycastBody(b, origin, dir, best, t, nrm) && t <= best) {
+            best = t;
+            bestBody = &b;
+            bestN = nrm;
+        }
+    };
+    for (uint32_t pi : m_rayPlanes)
+        test(pi);
+
+    if (!m_rayNodes.empty()) {
+        float enter;
+        if (RayBox(m_rayNodes[0].box, origin, dir, inv, best, enter)) {
+            uint32_t stack[64];
+            uint32_t sp = 0;
+            stack[sp++] = 0;
+            while (sp) {
+                const RayNode& n = m_rayNodes[stack[--sp]];
+                if (n.count) {
+                    for (uint32_t k = 0; k < n.count; ++k) {
+                        const uint32_t bi = m_rayItems[n.first + k];
+                        if (RayBox(m_bodies[bi].aabb, origin, dir, inv, best, enter))
+                            test(bi);
+                    }
+                    continue;
+                }
+                // Ближний ребёнок обходится первым: дальний часто отсекается по найденному best
+                float t0, t1;
+                const bool h0 = RayBox(m_rayNodes[n.first].box, origin, dir, inv, best, t0);
+                const bool h1 = RayBox(m_rayNodes[n.first + 1].box, origin, dir, inv, best, t1);
+                if (h0 && h1) {
+                    const bool nearFirst = t0 <= t1;
+                    stack[sp++] = nearFirst ? n.first + 1 : n.first;
+                    stack[sp++] = nearFirst ? n.first : n.first + 1;
+                } else if (h0) {
+                    stack[sp++] = n.first;
+                } else if (h1) {
+                    stack[sp++] = n.first + 1;
+                }
+            }
+        }
+    }
+    return bestBody != nullptr;
+}
+
+bool Physics::Raycast(Vec3 origin, Vec3 dir, float maxDist, RaycastHit& hit, uint32_t mask) const {
+    std::shared_lock lk(m_lock);
+    dir = Normalize(dir);
+    if (LengthSq(dir) == 0)
+        return false;
+    float best = maxDist;
+    const Body* bestBody = nullptr;
+    Vec3 bestN;
+    const bool found = m_rayValid ? RaycastTree(origin, dir, maxDist, mask, best, bestBody, bestN)
+                                  : RaycastLinear(origin, dir, maxDist, mask, best, bestBody, bestN);
+    if (!found)
         return false;
     hit.entity = Access::MakeEntity(bestBody->entity, bestBody->entityGen);
     hit.distance = best;

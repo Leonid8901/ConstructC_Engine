@@ -12,6 +12,7 @@ struct EngineConfig {
     bool rayTracing = false;   // стартовое значение флага Amper RT
     float targetFps = 60.0f;   // бюджет кадра для UniX
     uint32_t workerThreads = 0; // 0 = авто (ядра - 2)
+    uint32_t msaa = 4;          // сглаживание краёв: 1 (выкл), 2, 4, 8; больше, чем умеет GPU, — урежется
 };
 
 class Game {

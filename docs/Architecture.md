@@ -18,13 +18,13 @@
 ```
 Sys       главный поток   события окна, снимок ввода
 Update    UniX            пользовательские задачи (параллельно)   → Flush мира
-Simulate  UniX            Grave.Step (Actor)                      → события контактов → Flush
+Simulate  UniX            Grave.Step (Actor)                      → события контактов → Flush → область мира → BVH лучей
 Prepare   UniX            Amper.Prepare (Actor)
 Render    главный поток   TLAS → (каскады теней) → небо → инстансы → present
 EndFrame  UniX            статистика, классификация, разгрузка, ребаланс потоков
 ```
 
-Порядок вызовов в `Engine.cpp`: Update → Flush → Simulate → DispatchEvents → Flush → Prepare → Render → EndFrame.
+Порядок вызовов в `Engine.cpp`: Update → Flush → Simulate → DispatchEvents → Flush → EnforceBounds → RefreshQueries → Prepare → Render → EndFrame.
 
 Внутри стадии задачи выполняются параллельно; между стадиями — барьер. Задачи Simulate и Prepare внутренние (значимость Actor): `Grave.Step` и `Amper.Prepare`.
 

@@ -107,6 +107,7 @@ int Engine::Run(Game& game, const EngineConfig& cfg) {
 
         game.OnStart();
         world.Flush();
+        grave.RefreshQueries();
 
         using clock = std::chrono::steady_clock;
         const auto start = clock::now();
@@ -143,6 +144,8 @@ int Engine::Run(Game& game, const EngineConfig& cfg) {
                 CE_ZONE("Grave.Events + World.Flush");
                 grave.DispatchEvents();
                 world.Flush();
+                world.EnforceBounds();  // KillZ / возврат вылетевших
+                grave.RefreshQueries(); // дерево для Raycast на следующий кадр
             }
             scheduler.RunStage(Stage::Prepare);
 

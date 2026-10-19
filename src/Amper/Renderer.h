@@ -88,6 +88,11 @@ public:
     bool Shadows() const { return m_shadowsEnabled.load(); }
     void SetShadowDistance(float d);
 
+    void SetSamples(uint32_t n) { m_requestedSamples.store(n); }
+    uint32_t Samples() const { return m_appliedSamples.load(); }
+    uint32_t MaxSamples() const { return m_maxSamples; }
+    bool SamplesSupported(uint32_t n) const { return n == 1 || (n <= 8 && (m_sampleMask & n) && (n & (n - 1)) == 0); }
+
     Light AddLight(const GpuLight& l);
     template <class Fn>
     void ModifyLight(uint32_t index, uint32_t gen, Fn&& fn) {
@@ -141,7 +146,10 @@ private:
     void CreateFrames();
     void CreateDescriptors();
     void CreatePipelines();
-    void CreateDepth();
+    void DestroyPipelines();
+    void CreateTargets();  // глубина + MSAA-цвет под размер swapchain
+    void ApplySampleChange();
+    VkSampleCountFlagBits PickSamples(uint32_t requested) const;
     void CreateShadowResources();
     void ComputeCascades(FrameUbo& ubo, ShadowCull& cull, Vec3 camPos, Vec3 fwd, Vec3 right, Vec3 up, float tanHalf,
                          float aspect, Vec3 sunDir, float distance);
@@ -166,7 +174,15 @@ private:
     std::unique_ptr<Swapchain> m_swapchain;
     std::unique_ptr<MeshRegistry> m_meshes;
     Image m_depth;
+    Image m_msaaColor;  // только при m_samples > 1: рисуем в него, resolve — в изображение swapchain
     static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+    // MSAA
+    VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;
+    uint32_t m_maxSamples = 1;
+    VkSampleCountFlags m_sampleMask = VK_SAMPLE_COUNT_1_BIT;
+    std::atomic<uint32_t> m_requestedSamples{1};
+    std::atomic<uint32_t> m_appliedSamples{1};
 
     std::array<Frame, kFramesInFlight> m_frames{};
     std::vector<VkSemaphore> m_renderFinished;

@@ -40,6 +40,12 @@ struct AmperApi {
     bool Shadows() const;
     void SetShadowDistance(float meters) const;  // дальность теней от камеры, по умолчанию 80 м
 
+    // Сглаживание краёв (MSAA): 1 — выкл, 2, 4, 8. Применяется со следующего кадра (пересоздаёт цели рендера).
+    void SetAntialiasing(uint32_t samples) const;
+    uint32_t Antialiasing() const;      // фактическое число сэмплов
+    uint32_t MaxAntialiasing() const;   // максимум, который поддерживает GPU
+    bool AntialiasingSupported(uint32_t samples) const;  // неподдерживаемое значение округляется вниз
+
     Light AddPointLight(Vec3 position, Vec3 color, float intensity, float range, bool castShadows = false) const;
     uint32_t LightCount() const;
 
