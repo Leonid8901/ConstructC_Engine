@@ -4,6 +4,7 @@
 #include "Vulkan/VkCheck.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <set>
@@ -65,11 +66,11 @@ bool HasExtension(const std::vector<VkExtensionProperties>& exts, const char* na
 
 } // namespace
 
-VulkanContext::VulkanContext(const Window& window) {
+VulkanContext::VulkanContext(const Window& window, const std::string& devicePreference) {
     CreateInstance();
     SetupDebugMessenger();
     m_surface = window.CreateSurface(m_instance);
-    PickPhysicalDevice();
+    PickPhysicalDevice(devicePreference);
     CreateDevice();
 }
 
@@ -97,7 +98,9 @@ void VulkanContext::CreateInstance() {
     uint32_t loaderVersion = VK_API_VERSION_1_0;
     vkEnumerateInstanceVersion(&loaderVersion);
     if (loaderVersion < VK_API_VERSION_1_3)
-        throw std::runtime_error("Vulkan loader does not support 1.3");
+        throw std::runtime_error("Загрузчик Vulkan версии " + std::to_string(VK_API_VERSION_MAJOR(loaderVersion)) + "." +
+                                 std::to_string(VK_API_VERSION_MINOR(loaderVersion)) +
+                                 ", нужен 1.3. Обновите драйвер видеокарты (на Linux — пакет Mesa или драйвер NVIDIA).");
 
     m_validation = kWantValidation && HasLayer(kValidationLayer);
     if (kWantValidation && !m_validation)
@@ -123,7 +126,10 @@ void VulkanContext::CreateInstance() {
         info.ppEnabledLayerNames = &kValidationLayer;
         info.pNext = &debugInfo;
     }
-    VK_CHECK(vkCreateInstance(&info, nullptr, &m_instance));
+    const VkResult r = vkCreateInstance(&info, nullptr, &m_instance);
+    if (r == VK_ERROR_INCOMPATIBLE_DRIVER || r == VK_ERROR_INITIALIZATION_FAILED)
+        throw std::runtime_error("Не найден драйвер Vulkan. Установите драйвер видеокарты с поддержкой Vulkan 1.3.");
+    VK_CHECK(r);
 }
 
 void VulkanContext::SetupDebugMessenger() {
@@ -137,20 +143,27 @@ void VulkanContext::SetupDebugMessenger() {
     VK_CHECK(create(m_instance, &info, nullptr, &m_debugMessenger));
 }
 
-bool VulkanContext::IsDeviceSuitable(VkPhysicalDevice device, QueueFamilies& out) const {
+bool VulkanContext::IsDeviceSuitable(VkPhysicalDevice device, QueueFamilies& out, std::string& reason) const {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(device, &props);
-    if (props.apiVersion < VK_API_VERSION_1_3)
+    if (props.apiVersion < VK_API_VERSION_1_3) {
+        reason = "драйвер даёт Vulkan " + std::to_string(VK_API_VERSION_MAJOR(props.apiVersion)) + "." +
+                 std::to_string(VK_API_VERSION_MINOR(props.apiVersion)) + ", нужен 1.3 (обновите драйвер; если не помогает — GPU слишком старый)";
         return false;
-    if (!HasExtension(DeviceExtensions(device), VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+    }
+    if (!HasExtension(DeviceExtensions(device), VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+        reason = "нет VK_KHR_swapchain (не умеет выводить на экран)";
         return false;
+    }
 
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f13;
     vkGetPhysicalDeviceFeatures2(device, &f2);
-    if (!f13.dynamicRendering || !f13.synchronization2)
+    if (!f13.dynamicRendering || !f13.synchronization2) {
+        reason = "нет dynamicRendering/synchronization2";
         return false;
+    }
 
     uint32_t familyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(device, &familyCount, nullptr);
@@ -169,8 +182,10 @@ bool VulkanContext::IsDeviceSuitable(VkPhysicalDevice device, QueueFamilies& out
         if (graphics && r.graphics == UINT32_MAX) r.graphics = i;
         if (present && r.present == UINT32_MAX) r.present = i;
     }
-    if (r.graphics == UINT32_MAX || r.present == UINT32_MAX)
+    if (r.graphics == UINT32_MAX || r.present == UINT32_MAX) {
+        reason = r.graphics == UINT32_MAX ? "нет графической очереди" : "не может выводить в это окно";
         return false;
+    }
 
     // GPU-лейны UniX: ищем выделенные compute и transfer семьи
     r.compute = r.graphics;
@@ -189,39 +204,74 @@ bool VulkanContext::IsDeviceSuitable(VkPhysicalDevice device, QueueFamilies& out
     uint32_t formatCount = 0, modeCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(device, m_surface, &formatCount, nullptr);
     vkGetPhysicalDeviceSurfacePresentModesKHR(device, m_surface, &modeCount, nullptr);
-    if (formatCount == 0 || modeCount == 0)
+    if (formatCount == 0 || modeCount == 0) {
+        reason = "нет форматов/режимов показа для окна";
         return false;
+    }
 
     out = r;
     return true;
 }
 
-void VulkanContext::PickPhysicalDevice() {
+void VulkanContext::PickPhysicalDevice(const std::string& preference) {
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(m_instance, &count, nullptr);
     if (count == 0)
-        throw std::runtime_error("No Vulkan GPUs found");
+        throw std::runtime_error("Vulkan не нашёл ни одного GPU. Установите или обновите драйвер видеокарты.");
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(m_instance, &count, devices.data());
 
-    int best = -1;
-    for (VkPhysicalDevice d : devices) {
-        QueueFamilies families;
-        if (!IsDeviceSuitable(d, families))
-            continue;
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    const std::string pref = lower(preference);
+    const bool byIndex = !pref.empty() && std::all_of(pref.begin(), pref.end(), [](char c) { return c >= '0' && c <= '9'; });
+
+    long long best = -1;
+    bool preferredFound = false;
+    std::string rejected;
+    for (uint32_t i = 0; i < count; ++i) {
+        VkPhysicalDevice d = devices[i];
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(d, &props);
-        int score = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 1000
-                    : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 100
-                                                                                 : 1;
+        VkPhysicalDeviceMemoryProperties mem;
+        vkGetPhysicalDeviceMemoryProperties(d, &mem);
+        uint64_t vram = 0;
+        for (uint32_t h = 0; h < mem.memoryHeapCount; ++h)
+            if (mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                vram = std::max<uint64_t>(vram, mem.memoryHeaps[h].size);
+
+        QueueFamilies families;
+        std::string reason;
+        const bool ok = IsDeviceSuitable(d, families, reason);
+        Log("GPU " + std::to_string(i) + ": " + props.deviceName + " (" + GpuVendorName(props.vendorID) + ", " +
+            std::to_string(vram >> 20) + " МБ)" + (ok ? "" : " — не подходит: " + reason));
+        if (!ok) {
+            rejected += std::string("\n  ") + props.deviceName + ": " + reason;
+            continue;
+        }
+        long long score = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 3000
+                          : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2000
+                          : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? 1000
+                                                                                       : 0;
+        score += static_cast<long long>(std::min<uint64_t>(vram >> 30, 999));  // ГБ VRAM — при равном типе
+        const bool preferred = pref != "auto" && !pref.empty() &&
+                               (byIndex ? std::to_string(i) == pref : lower(props.deviceName).find(pref) != std::string::npos);
+        if (preferred) {
+            score += 1000000;
+            preferredFound = true;
+        }
         if (score > best) {
             best = score;
             m_physicalDevice = d;
             m_families = families;
         }
     }
+    if (pref != "auto" && !pref.empty() && !preferredFound)
+        Log("engine.json: GPU \"" + preference + "\" не найден или не подходит — выбран автоматически");
     if (!m_physicalDevice)
-        throw std::runtime_error("No GPU with Vulkan 1.3 + dynamicRendering + synchronization2");
+        throw std::runtime_error("Нет подходящего GPU (нужен Vulkan 1.3 c dynamic rendering и synchronization2):" + rejected);
 
     // Поддержка ray query
     auto exts = DeviceExtensions(m_physicalDevice);
@@ -245,10 +295,48 @@ void VulkanContext::PickPhysicalDevice() {
         p2.pNext = &m_asProps;
     vkGetPhysicalDeviceProperties2(m_physicalDevice, &p2);
     m_props = p2.properties;
+    FillInfo();
 
     Log(std::string("GPU: ") + m_props.deviceName + " | Vulkan " + std::to_string(VK_API_VERSION_MAJOR(m_props.apiVersion)) +
         "." + std::to_string(VK_API_VERSION_MINOR(m_props.apiVersion)) +
         " | ray query: " + (m_rtSupported ? "yes" : "no"));
+}
+
+void VulkanContext::FillInfo() {
+    GpuInfo& g = m_info;
+    g.vendorId = m_props.vendorID;
+    g.deviceId = m_props.deviceID;
+    g.vendor = GpuVendorName(m_props.vendorID);
+    g.name = m_props.deviceName;
+    g.apiVersion = m_props.apiVersion;
+    g.rayQuery = m_rtSupported;
+    switch (m_props.deviceType) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: g.type = GpuClass::Discrete; break;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: g.type = GpuClass::Integrated; break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: g.type = GpuClass::Virtual; break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: g.type = GpuClass::Software; break;
+    default: g.type = GpuClass::Unknown; break;
+    }
+
+    // Драйвер (Vulkan 1.2 core): различает RADV / AMDVLK / AMD proprietary, NVIDIA / NVK, ANV и т.д.
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &drv;
+    vkGetPhysicalDeviceProperties2(m_physicalDevice, &p2);
+    g.driver = std::string(drv.driverName) + (drv.driverInfo[0] ? std::string(" ") + drv.driverInfo : "");
+    if (drv.driverID == VK_DRIVER_ID_MESA_LLVMPIPE || drv.driverID == VK_DRIVER_ID_GOOGLE_SWIFTSHADER)
+        g.type = GpuClass::Software;  // некоторые сборки помечают себя не как CPU
+
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &mem);
+    for (uint32_t h = 0; h < mem.memoryHeapCount; ++h)
+        if (mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            g.vram = std::max<uint64_t>(g.vram, mem.memoryHeaps[h].size);
+    for (uint32_t t = 0; t < mem.memoryTypeCount; ++t) {
+        const VkMemoryPropertyFlags f = mem.memoryTypes[t].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            g.hostVisibleVram = std::max<uint64_t>(g.hostVisibleVram, mem.memoryHeaps[mem.memoryTypes[t].heapIndex].size);
+    }
 }
 
 void VulkanContext::CreateDevice() {

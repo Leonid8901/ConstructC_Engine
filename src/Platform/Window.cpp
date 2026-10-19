@@ -3,6 +3,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include "Core.h"
 #include "Platform/Input.h"
 #include "Platform/Window.h"
 #include "Vulkan/VkCheck.h"
@@ -20,12 +21,31 @@ struct WindowCallbacks {
     static void Scroll(GLFWwindow* w, double, double dy) { Get(w)->m_input->OnScroll(dy); }
 };
 
-Window::Window(uint32_t width, uint32_t height, const std::string& title, InputState* input) : m_input(input) {
-    if (!glfwInit())
-        throw std::runtime_error("glfwInit failed");
+Window::Window(uint32_t width, uint32_t height, const std::string& title, InputState* input,
+               const std::string& platform)
+    : m_input(input) {
+    glfwSetErrorCallback([](int code, const char* desc) { Log("GLFW " + std::to_string(code) + ": " + desc); });
+    int hint = GLFW_ANY_PLATFORM;
+    if (platform == "x11") hint = GLFW_PLATFORM_X11;
+    else if (platform == "wayland") hint = GLFW_PLATFORM_WAYLAND;
+    else if (platform == "win32") hint = GLFW_PLATFORM_WIN32;
+    if (hint != GLFW_ANY_PLATFORM && !glfwPlatformSupported(hint)) {
+        Log("Окно: платформа \"" + platform + "\" не поддерживается этой сборкой GLFW — выбор автоматически");
+        hint = GLFW_ANY_PLATFORM;
+    }
+    glfwInitHint(GLFW_PLATFORM, hint);
+    bool ok = glfwInit();
+    if (!ok && hint != GLFW_ANY_PLATFORM) {  // например, просили wayland, а сессия X11
+        Log("Окно: не удалось запустить \"" + platform + "\" — пробую автоматически");
+        glfwInitHint(GLFW_PLATFORM, GLFW_ANY_PLATFORM);
+        ok = glfwInit();
+    }
+    if (!ok)
+        throw std::runtime_error("Не удалось создать окно (glfwInit). На Linux нужен X11 или Wayland (DISPLAY / WAYLAND_DISPLAY).");
     if (!glfwVulkanSupported()) {
         glfwTerminate();
-        throw std::runtime_error("Vulkan loader/ICD not found");
+        throw std::runtime_error("Vulkan не найден: нет загрузчика vulkan-1 / libvulkan.so.1 или драйвера. "
+                                 "Установите драйвер видеокарты (на Linux — mesa-vulkan-drivers или драйвер NVIDIA).");
     }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -66,6 +86,16 @@ bool Window::ConsumeResized() {
 
 void Window::SetCursorLocked(bool locked) const {
     glfwSetInputMode(m_window, GLFW_CURSOR, locked ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+}
+
+std::string Window::PlatformName() const {
+    switch (glfwGetPlatform()) {
+    case GLFW_PLATFORM_WIN32: return "Win32";
+    case GLFW_PLATFORM_X11: return "X11";
+    case GLFW_PLATFORM_WAYLAND: return "Wayland";
+    case GLFW_PLATFORM_COCOA: return "Cocoa";
+    default: return "unknown";
+    }
 }
 
 VkSurfaceKHR Window::CreateSurface(VkInstance instance) const {

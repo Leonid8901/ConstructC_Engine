@@ -25,6 +25,8 @@ struct EngineConfig {
     float    targetFps = 60.0f;     // бюджет кадра для UniX
     uint32_t workerThreads = 0;     // 0 — авто: ядра − 2 (минимум 1)
     uint32_t msaa = 4;              // сглаживание: 1 (выкл), 2, 4, 8; урезается до возможностей GPU
+    uint32_t shadowMapSize = 0;     // 0 — по профилю железа
+    std::string configFile = "engine.json";  // рядом с exe; "" — без файла
 };
 
 class Game {
@@ -43,6 +45,21 @@ public:
 | `static double Time()` | время с запуска, с |
 | `static float DeltaTime()` | длительность прошлого кадра, с |
 | `static uint64_t Frame()` | номер кадра |
+| `static const SystemInfo& System()` | что движок узнал о железе и какой профиль выбрал |
+
+Значения `EngineConfig` — пожелания игры: профиль железа и `engine.json` игрока могут их изменить ([Platforms.md](Platforms.md#3-профили)). Например, `rayTracing = true` на встроенной графике останется выключенным, если игрок не включит его в `engine.json`.
+
+```cpp
+struct SystemInfo {
+    std::string os, windowPlatform;            // "Linux", "Wayland"
+    std::string cpuVendor, cpuName;
+    uint32_t cpuCores, cpuThreads; bool cpuHybrid;
+    std::string gpuVendor, gpuName, gpuType, gpuDriver;  // gpuType: discrete / integrated / software / virtual
+    uint64_t gpuMemoryMB;
+    std::string profile;                       // "AMD discrete"
+    bool configLoaded;                         // engine.json прочитан
+};
+```
 
 `OnStart` вызывается один раз до первого кадра на главном потоке. Команды мира в нём применяются сразу.
 

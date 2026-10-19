@@ -20,6 +20,7 @@ public:
 
     VkSwapchainKHR Handle() const { return m_swapchain; }
     VkFormat Format() const { return m_format; }
+    bool ManualSrgb() const { return m_manualSrgb; }  // формат UNORM: гамму кодирует шейдер
     VkExtent2D Extent() const { return m_extent; }
     uint32_t ImageCount() const { return static_cast<uint32_t>(m_images.size()); }
     VkImage Image(uint32_t i) const { return m_images[i]; }
@@ -35,6 +36,7 @@ private:
 
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
     VkFormat m_format = VK_FORMAT_UNDEFINED;
+    bool m_manualSrgb = false;
     VkExtent2D m_extent{};
     std::vector<VkImage> m_images;
     std::vector<VkImageView> m_views;

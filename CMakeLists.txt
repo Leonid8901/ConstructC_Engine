@@ -8,11 +8,30 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 find_package(Vulkan REQUIRED)
+find_package(Threads REQUIRED)
 
 include(FetchContent)
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+# Linux: GLFW собирается и с X11, и с Wayland, если для Wayland есть пакеты; иначе только X11.
+# Выбор во время запуска: Wayland-сессия -> Wayland, иначе X11 (переопределяется в engine.json).
+if(UNIX AND NOT APPLE AND NOT DEFINED GLFW_BUILD_WAYLAND)
+    set(CE_WAYLAND OFF)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(CE_WL QUIET wayland-client wayland-cursor wayland-egl xkbcommon)
+        find_program(CE_WAYLAND_SCANNER wayland-scanner)
+        if(CE_WL_FOUND AND CE_WAYLAND_SCANNER)
+            set(CE_WAYLAND ON)
+        endif()
+    endif()
+    set(GLFW_BUILD_WAYLAND ${CE_WAYLAND} CACHE BOOL "GLFW Wayland backend")
+    if(NOT CE_WAYLAND)
+        message(STATUS "CustomEngine: Wayland выключен (нужны libwayland-dev, libxkbcommon-dev, wayland-scanner) — только X11")
+    endif()
+endif()
 FetchContent_Declare(glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
     GIT_TAG 3.4)
@@ -27,7 +46,7 @@ add_library(CustomEngine STATIC ${ENGINE_SOURCES})
 target_include_directories(CustomEngine
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include      # то, что видит игра: без Vulkan, glm и GLFW
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator)
+target_link_libraries(CustomEngine PRIVATE Vulkan::Vulkan glfw GPUOpen::VulkanMemoryAllocator Threads::Threads)
 
 # Профилирование через Tracy: cmake -DCE_PROFILE=ON (по умолчанию выключено и ничего не стоит)
 option(CE_PROFILE "Профилирование через Tracy" OFF)
@@ -85,6 +104,10 @@ if(MSVC)
 else()
     target_compile_options(Sandbox PRIVATE -Wall -Wextra)
 endif()
+
+# Раздача: cmake --install build --prefix <папка> кладёт Sandbox и shaders/ рядом (запуск откуда угодно)
+install(TARGETS Sandbox RUNTIME DESTINATION .)
+install(DIRECTORY ${SHADER_OUT_DIR}/ DESTINATION shaders FILES_MATCHING PATTERN "*.spv")
 
 # ---------------- Бенчмарки (cmake -DCE_BUILD_BENCH=ON) ----------------
 option(CE_BUILD_BENCH "Собрать бенчмарки UniXBench и SceneBench" OFF)
