@@ -93,6 +93,9 @@ public:
         m_opt = opt;
 
         out.path = m_path;
+        LoadNodes(out);
+        LoadSkins(out);
+        LoadAnimations(out);
         const cgltf_scene* scene = m_data->scene ? m_data->scene : (m_data->scenes_count ? &m_data->scenes[0] : nullptr);
         if (scene) {
             for (cgltf_size i = 0; i < scene->nodes_count; ++i)
@@ -118,7 +121,7 @@ public:
             for (int c = 0; c < 8; ++c) {
                 const Vec3 corner{(c & 1) ? b.second.x : b.first.x, (c & 2) ? b.second.y : b.first.y,
                                   (c & 4) ? b.second.z : b.first.z};
-                const Vec3 w = p.local.TransformPoint(corner);
+                const Vec3 w = p.local.TransformPoint(corner);  // у частей со скином local = единичная
                 out.boundsMin = Min(out.boundsMin, w);
                 out.boundsMax = Max(out.boundsMax, w);
             }
@@ -126,6 +129,99 @@ public:
     }
 
 private:
+    uint32_t NodeIndex(const cgltf_node* n) const { return static_cast<uint32_t>(n - m_data->nodes); }
+
+    // Все узлы файла (кости могут лежать вне сцены) + порядок обхода «родитель раньше детей»
+    void LoadNodes(ModelData& out) {
+        out.nodes.resize(m_data->nodes_count);
+        for (cgltf_size i = 0; i < m_data->nodes_count; ++i) {
+            const cgltf_node& n = m_data->nodes[i];
+            ModelNode& dst = out.nodes[i];
+            dst.parent = n.parent ? static_cast<int32_t>(NodeIndex(n.parent)) : -1;
+            if (n.has_matrix) {
+                dst.hasMatrix = true;
+                dst.matrix = ToMat4(n.matrix);
+            }
+            if (n.has_translation) dst.t = {n.translation[0], n.translation[1], n.translation[2]};
+            if (n.has_rotation) dst.r = Normalize(Quat{n.rotation[0], n.rotation[1], n.rotation[2], n.rotation[3]});
+            if (n.has_scale) dst.s = {n.scale[0], n.scale[1], n.scale[2]};
+        }
+        std::vector<uint8_t> visited(out.nodes.size(), 0);
+        std::vector<uint32_t> stack;
+        for (uint32_t i = 0; i < out.nodes.size(); ++i) {
+            if (out.nodes[i].parent >= 0)
+                continue;
+            stack.push_back(i);
+            while (!stack.empty()) {
+                const uint32_t k = stack.back();
+                stack.pop_back();
+                if (visited[k])
+                    continue;  // защита от циклов в битом файле
+                visited[k] = 1;
+                out.order.push_back(k);
+                const cgltf_node& n = m_data->nodes[k];
+                for (cgltf_size c = 0; c < n.children_count; ++c)
+                    stack.push_back(NodeIndex(n.children[c]));
+            }
+        }
+    }
+
+    void LoadSkins(ModelData& out) {
+        out.skins.resize(m_data->skins_count);
+        for (cgltf_size s = 0; s < m_data->skins_count; ++s) {
+            const cgltf_skin& skin = m_data->skins[s];
+            ModelSkin& dst = out.skins[s];
+            dst.joints.resize(skin.joints_count);
+            dst.inverseBind.resize(skin.joints_count);
+            for (cgltf_size j = 0; j < skin.joints_count; ++j) {
+                dst.joints[j] = NodeIndex(skin.joints[j]);
+                if (skin.inverse_bind_matrices) {
+                    float m[16];
+                    cgltf_accessor_read_float(skin.inverse_bind_matrices, j, m, 16);
+                    dst.inverseBind[j] = ToMat4(m);
+                }
+            }
+        }
+    }
+
+    void LoadAnimations(ModelData& out) {
+        for (cgltf_size a = 0; a < m_data->animations_count; ++a) {
+            const cgltf_animation& anim = m_data->animations[a];
+            AnimClip clip;
+            clip.name = anim.name ? anim.name : "animation" + std::to_string(a);
+            for (cgltf_size c = 0; c < anim.channels_count; ++c) {
+                const cgltf_animation_channel& ch = anim.channels[c];
+                if (!ch.target_node || !ch.sampler)
+                    continue;
+                AnimChannel dst;
+                switch (ch.target_path) {
+                case cgltf_animation_path_type_translation: dst.path = AnimPath::Translation; break;
+                case cgltf_animation_path_type_rotation: dst.path = AnimPath::Rotation; break;
+                case cgltf_animation_path_type_scale: dst.path = AnimPath::Scale; break;
+                default: continue;  // морфинг (weights) не поддерживается
+                }
+                dst.node = NodeIndex(ch.target_node);
+                const cgltf_animation_sampler& sm = *ch.sampler;
+                dst.interp = sm.interpolation == cgltf_interpolation_type_step          ? AnimInterp::Step
+                             : sm.interpolation == cgltf_interpolation_type_cubic_spline ? AnimInterp::CubicSpline
+                                                                                         : AnimInterp::Linear;
+                const size_t keys = sm.input->count;
+                dst.times.resize(keys);
+                cgltf_accessor_unpack_floats(sm.input, dst.times.data(), keys);
+                const size_t comps = dst.path == AnimPath::Rotation ? 4 : 3;
+                const size_t perKey = dst.interp == AnimInterp::CubicSpline ? 3 : 1;
+                if (keys == 0 || sm.output->count != keys * perKey)
+                    continue;  // битый канал
+                dst.values.resize(sm.output->count * comps);
+                for (size_t k = 0; k < sm.output->count; ++k)
+                    cgltf_accessor_read_float(sm.output, k, &dst.values[k * comps], comps);
+                clip.duration = std::max(clip.duration, dst.times.back());
+                clip.channels.push_back(std::move(dst));
+            }
+            out.clips.push_back(std::move(clip));
+        }
+    }
+
     void Visit(const cgltf_node* node, const Mat4& parent, ModelData& out) {
         float local[16];
         cgltf_node_transform_local(node, local);
@@ -139,10 +235,12 @@ private:
                     continue;
                 }
                 ModelPart part;
-                part.mesh = PrimitiveMesh(&prim);
+                const bool skinned = node->skin && HasSkinAttributes(prim);
+                part.skin = skinned ? static_cast<int32_t>(node->skin - m_data->skins) : -1;
+                part.mesh = PrimitiveMesh(&prim, skinned ? node->skin : nullptr);
                 part.material = ConvertMaterial(prim.material);
-                part.local = world;
-                part.node = static_cast<uint32_t>(node - m_data->nodes);
+                part.local = skinned ? Mat4{} : world;  // вершины скина уже в координатах модели (через кости)
+                part.node = NodeIndex(node);
                 out.parts.push_back(part);
             }
         }
@@ -150,18 +248,31 @@ private:
             Visit(node->children[i], world, out);
     }
 
-    uint32_t PrimitiveMesh(const cgltf_primitive* prim) {
+    static bool HasSkinAttributes(const cgltf_primitive& prim) {
+        bool j = false, w = false;
+        for (cgltf_size a = 0; a < prim.attributes_count; ++a) {
+            if (prim.attributes[a].index != 0)
+                continue;
+            j |= prim.attributes[a].type == cgltf_attribute_type_joints;
+            w |= prim.attributes[a].type == cgltf_attribute_type_weights;
+        }
+        return j && w;
+    }
+
+    uint32_t PrimitiveMesh(const cgltf_primitive* prim, const cgltf_skin* skin) {
         auto it = m_primCache.find(prim);
         if (it != m_primCache.end())
             return it->second;
 
-        const cgltf_accessor *pos = nullptr, *nrm = nullptr, *uv = nullptr, *tan = nullptr;
+        const cgltf_accessor *pos = nullptr, *nrm = nullptr, *uv = nullptr, *tan = nullptr, *jnt = nullptr, *wgt = nullptr;
         for (cgltf_size a = 0; a < prim->attributes_count; ++a) {
             const cgltf_attribute& at = prim->attributes[a];
             if (at.type == cgltf_attribute_type_position) pos = at.data;
             else if (at.type == cgltf_attribute_type_normal) nrm = at.data;
             else if (at.type == cgltf_attribute_type_texcoord && at.index == 0) uv = at.data;
             else if (at.type == cgltf_attribute_type_tangent) tan = at.data;
+            else if (at.type == cgltf_attribute_type_joints && at.index == 0) jnt = at.data;
+            else if (at.type == cgltf_attribute_type_weights && at.index == 0) wgt = at.data;
         }
         if (!pos)
             throw std::runtime_error("Model::Load: " + m_path + ": примитив без POSITION");
@@ -185,6 +296,29 @@ private:
                 v[i].tangent = {Normalize(Vec3{f[0], f[1], f[2]}), f[3] < 0 ? -1.0f : 1.0f};
             }
         }
+        std::vector<SkinVertex> sk;
+        if (skin && jnt && wgt) {
+            sk.resize(n);
+            const uint32_t jointCount = static_cast<uint32_t>(skin->joints_count);
+            for (size_t i = 0; i < n; ++i) {
+                cgltf_uint j[4] = {};
+                float w[4] = {};
+                cgltf_accessor_read_uint(jnt, i, j, 4);
+                cgltf_accessor_read_float(wgt, i, w, 4);
+                float sum = 0;
+                for (int k = 0; k < 4; ++k) {
+                    if (j[k] >= jointCount || !(w[k] > 0)) {  // кость вне скина или NaN — вес в ноль
+                        j[k] = 0;
+                        w[k] = 0;
+                    }
+                    sum += w[k];
+                }
+                for (int k = 0; k < 4; ++k) {
+                    sk[i].joints[k] = j[k];
+                    sk[i].weights[k] = sum > 0 ? w[k] / sum : (k == 0 ? 1.0f : 0.0f);
+                }
+            }
+        }
         std::vector<uint32_t> idx;
         if (prim->indices) {
             idx.resize(prim->indices->count);
@@ -199,6 +333,7 @@ private:
 
         if (!nrm) {  // по спецификации — плоские нормали: каждая вершина треугольника своя
             std::vector<Vertex> flat;
+            std::vector<SkinVertex> flatSkin;
             flat.reserve(idx.size());
             for (size_t i = 0; i + 2 < idx.size(); i += 3) {
                 Vertex a = v[idx[i]], b = v[idx[i + 1]], c = v[idx[i + 2]];
@@ -207,8 +342,12 @@ private:
                 flat.push_back(a);
                 flat.push_back(b);
                 flat.push_back(c);
+                if (!sk.empty())
+                    for (size_t k = 0; k < 3; ++k)
+                        flatSkin.push_back(sk[idx[i + k]]);
             }
             v.swap(flat);
+            sk.swap(flatSkin);
             for (size_t i = 0; i < idx.size(); ++i)
                 idx[i] = static_cast<uint32_t>(i);
             tan = nullptr;
@@ -221,7 +360,10 @@ private:
             lo = Min(lo, vx.position);
             hi = Max(hi, vx.position);
         }
-        const uint32_t id = m_meshes.Create(v.data(), v.size(), idx.data(), idx.size());
+        for (uint32_t i : idx)
+            if (i >= v.size())
+                throw std::runtime_error("Model::Load: " + m_path + ": индекс вершины вне диапазона");
+        const uint32_t id = m_meshes.Create(v.data(), v.size(), idx.data(), idx.size(), sk.empty() ? nullptr : sk.data());
         m_meshBounds[id] = {lo, hi};
         m_primCache.emplace(prim, id);
         return id;

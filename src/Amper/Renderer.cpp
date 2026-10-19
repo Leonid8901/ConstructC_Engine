@@ -182,11 +182,21 @@ Renderer::Renderer(const VulkanContext& ctx, Gpu& gpu, GpuLanes& lanes, Window& 
     CreateFrames();
     CreateRenderFinished();
     CreatePipelines();
+    CreateSkinPipeline();
 }
 
 Renderer::~Renderer() {
     vkDeviceWaitIdle(m_device);
+    for (auto& [index, a] : m_animators)
+        for (SkinnedPart& sp : a->skinned)
+            DestroySkinnedPart(sp);
+    for (Retired& r : m_retired)
+        for (SkinnedPart& sp : r.parts)
+            DestroySkinnedPart(sp);
+    vkDestroyPipeline(m_device, m_skinPipeline, nullptr);
+    vkDestroyPipelineLayout(m_device, m_skinLayout, nullptr);
     for (Frame& f : m_frames) {
+        m_gpu.Destroy(f.joints);
         vkDestroyCommandPool(m_device, f.pool, nullptr);
         vkDestroySemaphore(m_device, f.imageAvailable, nullptr);
         vkDestroyFence(m_device, f.fence, nullptr);
@@ -587,6 +597,239 @@ void Renderer::HandleResize() {
     }
 }
 
+// ---------------- скелетная анимация ----------------
+
+void Renderer::CreateSkinPipeline() {
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SkinJob)};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &push;
+    VK_CHECK(vkCreatePipelineLayout(m_device, &li, nullptr, &m_skinLayout));
+    VkShaderModule cs = LoadShader(m_device, "skin.comp.spv");
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr};
+    ci.layout = m_skinLayout;
+    const VkResult r = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &ci, nullptr, &m_skinPipeline);
+    vkDestroyShaderModule(m_device, cs, nullptr);
+    VK_CHECK(r);
+}
+
+void Renderer::EnsureJointCapacity(Frame& f, uint32_t count) {
+    if (count <= f.jointCapacity && f.joints)
+        return;
+    uint32_t cap = std::max(f.jointCapacity, 256u);
+    while (cap < count)
+        cap *= 2;
+    m_gpu.Destroy(f.joints);
+    f.joints = m_gpu.CreateBuffer(sizeof(Mat4) * cap,
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                  MemUsage::Stream);
+    f.jointCapacity = cap;
+}
+
+// Скиннутые вершины сущности + BLAS с ALLOW_UPDATE (каждый кадр обновляется, а не строится заново)
+void Renderer::CreateSkinnedPart(SkinnedPart& sp, const MeshGpu& mesh) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (m_rtSupported)
+        usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    sp.out = m_gpu.CreateBuffer(VkDeviceSize(mesh.vertexCount) * sizeof(Vertex), usage, MemUsage::GpuOnly);
+    if (!m_rtSupported)
+        return;
+
+    VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    auto& tri = geom.geometry.triangles;
+    tri.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    tri.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    tri.vertexStride = sizeof(Vertex);
+    tri.maxVertex = mesh.vertexCount - 1;
+    tri.indexType = VK_INDEX_TYPE_UINT32;
+    VkAccelerationStructureBuildGeometryInfoKHR build{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    build.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    build.flags = VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    build.geometryCount = 1;
+    build.pGeometries = &geom;
+    const uint32_t primitives = mesh.indexCount / 3;
+    VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    m_gpu.Rt().buildSizes(m_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build, &primitives, &sizes);
+
+    sp.blasBuffer = m_gpu.CreateBuffer(sizes.accelerationStructureSize,
+                                       VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                       MemUsage::GpuOnly);
+    VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    ci.buffer = sp.blasBuffer.buffer;
+    ci.size = sizes.accelerationStructureSize;
+    ci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    VK_CHECK(m_gpu.Rt().createAs(m_device, &ci, nullptr, &sp.blas));
+    sp.scratch = m_gpu.CreateBuffer(std::max(sizes.buildScratchSize, sizes.updateScratchSize),
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                    MemUsage::GpuOnly, false, m_gpu.ScratchAlignment());
+    VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    ai.accelerationStructure = sp.blas;
+    sp.blasAddress = m_gpu.Rt().asAddress(m_device, &ai);
+}
+
+void Renderer::DestroySkinnedPart(SkinnedPart& sp) {
+    if (sp.blas)
+        m_gpu.Rt().destroyAs(m_device, sp.blas, nullptr);
+    m_gpu.Destroy(sp.blasBuffer);
+    m_gpu.Destroy(sp.scratch);
+    m_gpu.Destroy(sp.out);
+    sp = {};
+}
+
+// Аниматор сущности: создаётся при первой встрече, пересоздаётся при смене модели/поколения.
+// Команды Play/Stop доходят через animSerial.
+Renderer::Animator* Renderer::SyncAnimator(uint32_t entity, const EntityData& d, const ModelData& md) {
+    auto& slot = m_animators[entity];
+    if (slot && (slot->gen != d.gen || slot->model != d.model)) {
+        m_retired.push_back({std::move(slot->skinned), m_prepareCount});
+        slot.reset();
+    }
+    if (!slot) {
+        slot = std::make_unique<Animator>();
+        Animator& a = *slot;
+        a.entity = entity;
+        a.gen = d.gen;
+        a.model = d.model;
+        a.skinBase.assign(md.skins.size(), 0);
+        for (uint32_t p = 0; p < md.parts.size(); ++p)
+            if (md.parts[p].skin >= 0)
+                if (const MeshGpu* mesh = m_meshes->Get(md.parts[p].mesh); mesh && mesh->skin) {
+                    SkinnedPart sp;
+                    sp.part = p;
+                    sp.mesh = md.parts[p].mesh;
+                    CreateSkinnedPart(sp, *mesh);
+                    a.skinned.push_back(sp);
+                }
+        RestPose(md, a.pose);
+        a.globals.clear();
+    }
+    Animator& a = *slot;
+    a.seen = m_prepareCount;
+    a.speed = d.animSpeed;
+    if (a.serial != d.animSerial) {  // новая команда: переход от того, что играло, к новому клипу
+        a.serial = d.animSerial;
+        a.prevClip = a.clip;
+        a.prevTime = a.time;
+        a.prevLoop = a.loop;
+        a.fadeDur = a.globals.empty() ? 0.0f : d.animFade;  // первый кадр — без перехода
+        a.fade = 0;
+        a.clip = d.animClip < md.clips.size() ? static_cast<int32_t>(d.animClip) : -1;
+        a.time = a.speed < 0 && a.clip >= 0 ? md.clips[a.clip].duration : 0.0f;
+        a.loop = d.animLoop;
+        a.playing = a.clip >= 0;
+    }
+    return &a;
+}
+
+namespace {
+float Advance(float t, float dt, float duration, bool loop, bool& playing) {
+    if (duration <= 0) {
+        playing = false;
+        return 0;
+    }
+    t += dt;
+    if (loop) {
+        t = std::fmod(t, duration);
+        return t < 0 ? t + duration : t;
+    }
+    if (t >= duration) {  // однократная: стоп на последнем кадре (или первом при обратной скорости)
+        t = duration;
+        if (dt > 0) playing = false;
+    } else if (t <= 0) {
+        t = 0;
+        if (dt < 0) playing = false;
+    }
+    return t;
+}
+} // namespace
+
+void Renderer::Animate(Animator& a, float dt) {
+    const ModelData& md = *m_models->Get(a.model);
+    const float adt = dt * a.speed;
+    if (a.clip >= 0)
+        a.time = Advance(a.time, adt, md.clips[a.clip].duration, a.loop, a.playing);
+    RestPose(md, a.pose);
+    if (a.clip >= 0)
+        SampleClip(md.clips[a.clip], a.time, a.pose);
+
+    if (a.fade < a.fadeDur) {  // переход: старая поза -> новая
+        a.fade += dt;
+        bool prevPlaying = true;
+        if (a.prevClip >= 0)
+            a.prevTime = Advance(a.prevTime, adt, md.clips[a.prevClip].duration, a.prevLoop, prevPlaying);
+        RestPose(md, a.prevPose);
+        if (a.prevClip >= 0)
+            SampleClip(md.clips[a.prevClip], a.prevTime, a.prevPose);
+        BlendPose(a.prevPose, a.pose, a.fade / a.fadeDur);
+        std::swap(a.pose, a.prevPose);
+    }
+    ComputeGlobals(md, a.pose, a.globals);
+}
+
+// Скиннинг и BLAS скиннутых частей: до сборки TLAS
+void Renderer::RecordSkinning(Frame& f) {
+    if (f.skinJobs.empty())
+        return;
+    VkCommandBuffer cmd = f.cmd;
+    // Прошлый кадр мог ещё читать эти вершины (вершинный вход, сборка BLAS): ждём, потом пишем
+    MemBarrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | (m_rtSupported ? VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR : 0),
+               VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_NONE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_skinPipeline);
+    for (const SkinJob& job : f.skinJobs) {
+        vkCmdPushConstants(cmd, m_skinLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SkinJob), &job);
+        vkCmdDispatch(cmd, (job.count + 63) / 64, 1, 1);
+    }
+    VkPipelineStageFlags2 dst = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+    VkAccessFlags2 dstAccess = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    if (f.rt && !f.skinBlas.empty()) {
+        dst |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        dstAccess |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                     VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    }
+    // + прошлый кадр читал BLAS лучами во фрагментном шейдере: обновлять можно только после
+    MemBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | (f.rt ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : 0),
+               VK_ACCESS_2_SHADER_WRITE_BIT, dst, dstAccess);
+    if (!f.rt || f.skinBlas.empty())
+        return;
+
+    for (SkinnedPart* sp : f.skinBlas) {
+        const MeshGpu* mesh = m_meshes->Get(sp->mesh);
+        VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+        geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        auto& tri = geom.geometry.triangles;
+        tri.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tri.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tri.vertexData.deviceAddress = sp->out.address;
+        tri.vertexStride = sizeof(Vertex);
+        tri.maxVertex = mesh->vertexCount - 1;
+        tri.indexType = VK_INDEX_TYPE_UINT32;
+        tri.indexData.deviceAddress = mesh->indices.address;
+        VkAccelerationStructureBuildGeometryInfoKHR build{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+        build.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        build.flags = VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        build.mode = sp->built ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        build.srcAccelerationStructure = sp->built ? sp->blas : VK_NULL_HANDLE;
+        build.dstAccelerationStructure = sp->blas;
+        build.geometryCount = 1;
+        build.pGeometries = &geom;
+        build.scratchData.deviceAddress = sp->scratch.address;
+        VkAccelerationStructureBuildRangeInfoKHR range{};
+        range.primitiveCount = mesh->indexCount / 3;
+        const VkAccelerationStructureBuildRangeInfoKHR* ranges = &range;
+        m_gpu.Rt().cmdBuild(cmd, 1, &build, &ranges);
+        sp->built = true;
+    }
+    // BLAS готовы -> TLAS их читает
+    MemBarrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+               VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+}
+
 // ---------------- освещение ----------------
 
 void Renderer::SetSun(Vec3 dir, Vec3 color, float intensity) {
@@ -690,7 +933,8 @@ void Renderer::RecordShadowPass(Frame& f) {
         for (const Draw& d : f.shadowDraws[c]) {  // только то, что попадает в объём каскада
             const MeshGpu* mesh = m_meshes->Get(d.mesh);
             VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertices.buffer, &offset);
+            const VkBuffer vb = d.vertices ? d.vertices : mesh->vertices.buffer;  // скиннутые — свои вершины
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
             vkCmdBindIndexBuffer(cmd, mesh->indices.buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, mesh->indexCount, d.count, 0, 0, d.first);
         }
@@ -759,25 +1003,122 @@ void Renderer::Prepare(Task& task) {
     // 1. Список инстансов (сущность с мешем — один, с моделью — по одному на часть) и ранг внутри
     //    группы отрисовки. Группа = меш + односторонний/двусторонний: один draw на группу.
     //    Последовательно и дёшево; тяжёлая работа — в ParallelFor ниже.
-    const uint32_t groups = meshCount * 2;
-    m_meshCounts.assign(groups, 0);
+    ++m_prepareCount;
+    // Ресурсы удалённых аниматоров: кадр, который мог их читать, уже прошёл свой fence
+    std::erase_if(m_retired, [&](Retired& r) {
+        if (r.frame + kFramesInFlight > m_prepareCount)
+            return false;
+        for (SkinnedPart& sp : r.parts)
+            DestroySkinnedPart(sp);
+        return true;
+    });
+
+    const uint32_t meshGroups = meshCount * 2;
+    m_meshCounts.assign(meshGroups, 0);
     m_refs.clear();
-    auto add = [&](uint32_t entity, uint32_t part, uint32_t mesh, bool twoSided) {
+    m_skinRefs.clear();
+    m_activeAnimators.clear();
+    auto add = [&](uint32_t entity, uint32_t part, uint32_t mesh, bool twoSided, const Animator* anim) {
         if (mesh >= meshCount || !m_meshes->Get(mesh))
             return;
         const uint32_t key = (twoSided ? meshCount : 0) + mesh;
-        m_refs.push_back({entity, part, key, m_meshCounts[key]++});
+        m_refs.push_back({entity, part, key, m_meshCounts[key]++, anim});
     };
     for (uint32_t i = 0; i < cap; ++i) {
         const EntityData& d = world.At(i);
-        if (!d.alive || !d.visible)
+        if (!d.alive)
             continue;
-        if (d.model != UINT32_MAX) {
-            if (const ModelData* md = m_models->Get(d.model))
-                for (uint32_t p = 0; p < md->parts.size(); ++p)
-                    add(i, p, md->parts[p].mesh, md->parts[p].material.doubleSided);
+        const ModelData* md = d.model != UINT32_MAX ? m_models->Get(d.model) : nullptr;
+        // Аниматор живёт и у скрытой сущности: состояние анимации не сбрасывается от SetVisible(false)
+        Animator* anim = md && md->animated() ? SyncAnimator(i, d, *md) : nullptr;
+        if (anim)
+            m_activeAnimators.push_back(anim);
+        if (!d.visible)
+            continue;
+        if (md) {
+            for (uint32_t p = 0; p < md->parts.size(); ++p) {
+                if (anim && md->parts[p].skin >= 0) {
+                    // Часть со скином: свои вершины -> своя группа отрисовки из одного инстанса
+                    for (SkinnedPart& sp : anim->skinned)
+                        if (sp.part == p)
+                            m_skinRefs.push_back({i, p, &sp});
+                    continue;
+                }
+                add(i, p, md->parts[p].mesh, md->parts[p].material.doubleSided, anim);
+            }
         } else if (d.mesh != UINT32_MAX) {
-            add(i, UINT32_MAX, d.mesh, d.material.doubleSided);
+            add(i, UINT32_MAX, d.mesh, d.material.doubleSided, nullptr);
+        }
+    }
+    // Аниматоры исчезнувших сущностей (или сменивших модель на неанимированную)
+    for (auto it = m_animators.begin(); it != m_animators.end();) {
+        if (it->second->seen != m_prepareCount) {
+            m_retired.push_back({std::move(it->second->skinned), m_prepareCount});
+            it = m_animators.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Группы скиннутых частей идут после групп мешей
+    const uint32_t groups = meshGroups + static_cast<uint32_t>(m_skinRefs.size());
+    m_meshCounts.resize(groups, 0);
+    for (uint32_t k = 0; k < m_skinRefs.size(); ++k) {
+        m_refs.push_back({m_skinRefs[k].entity, m_skinRefs[k].part, meshGroups + k, 0,
+                          m_animators[m_skinRefs[k].entity].get()});
+        m_meshCounts[meshGroups + k] = 1;
+    }
+
+    // Анимации: поза -> матрицы узлов (параллельно по аниматорам), обратная связь в мир
+    {
+        const float dt = Core().dt.load(std::memory_order_relaxed);
+        const uint32_t animCount = static_cast<uint32_t>(m_activeAnimators.size());
+        task.ParallelFor(animCount, [&](uint32_t begin, uint32_t end) {
+            for (uint32_t k = begin; k < end; ++k) {
+                Animator& a = *m_activeAnimators[k];
+                Animate(a, dt);
+                EntityData& d = world.At(a.entity);  // пишем только поля обратной связи; читают их в Update
+                d.animTime = a.time;
+                d.animPlaying = a.playing;
+            }
+        });
+    }
+    // Палитры костей: по скину каждого аниматора — joint = globals[кость] * inverseBind
+    f.skinJobs.clear();
+    f.skinBlas.clear();
+    {
+        uint32_t joints = 0;
+        for (Animator* a : m_activeAnimators) {
+            const ModelData& md = *m_models->Get(a->model);
+            for (size_t s = 0; s < md.skins.size(); ++s) {
+                a->skinBase[s] = joints;
+                joints += static_cast<uint32_t>(md.skins[s].joints.size());
+            }
+        }
+        if (joints > 0) {
+            EnsureJointCapacity(f, joints);
+            auto* palette = static_cast<Mat4*>(f.joints.mapped);
+            for (Animator* a : m_activeAnimators) {
+                const ModelData& md = *m_models->Get(a->model);
+                for (size_t s = 0; s < md.skins.size(); ++s) {
+                    const ModelSkin& skin = md.skins[s];
+                    for (size_t j = 0; j < skin.joints.size(); ++j) {
+                        const Mat4 m = a->globals[skin.joints[j]] * skin.inverseBind[j];
+                        std::memcpy(&palette[a->skinBase[s] + j], &m, sizeof(Mat4));  // write-combined: только запись
+                    }
+                }
+            }
+        }
+        for (const SkinRef& sr : m_skinRefs) {
+            const Animator& a = *m_animators[sr.entity];
+            const ModelData& md = *m_models->Get(a.model);
+            const MeshGpu* mesh = m_meshes->Get(sr.sp->mesh);
+            SkinJob job{};
+            job.src = mesh->vertices.address;
+            job.skin = mesh->skin.address;
+            job.joints = f.joints.address + VkDeviceSize(a.skinBase[md.parts[sr.part].skin]) * sizeof(Mat4);
+            job.dst = sr.sp->out.address;
+            job.count = mesh->vertexCount;
+            f.skinJobs.push_back(job);
         }
     }
     m_meshOffsets.resize(groups);
@@ -794,6 +1135,9 @@ void Renderer::Prepare(Task& task) {
     if (f.rt)
         EnsureTlasCapacity(f, std::max(total, 1u));
     f.tlasCount = f.rt ? total : 0;
+    if (f.rt)
+        for (const SkinRef& sr : m_skinRefs)
+            f.skinBlas.push_back(sr.sp);
 
     // 2. Камера, свет, каскады — до инстансов, потому что по ним идёт отсечение
     Vec3 camPos;
@@ -869,8 +1213,13 @@ void Renderer::Prepare(Task& task) {
             const Material& mat = part ? part->material : d.material;
             const MeshGpu* mesh = m_meshes->Get(part ? part->mesh : d.mesh);
             const uint32_t idx = m_meshOffsets[ref.key] + ref.slot;
+            const bool skinned = ref.key >= meshGroups;
+            const SkinnedPart* sp = skinned ? m_skinRefs[ref.key - meshGroups].sp : nullptr;
             const Mat4 entityM = Mat4::TRS(d.pos, d.rot, d.scale);
-            const Mat4 model = part ? entityM * part->local : entityM;
+            // Скиннутые вершины уже в координатах модели; у анимированной модели узлы берут позу аниматора
+            const Mat4 model = !part || skinned ? entityM
+                               : ref.anim && !ref.anim->globals.empty() ? entityM * ref.anim->globals[part->node]
+                                                                        : entityM * part->local;
 
             GpuInstance g;
             std::memcpy(g.model, model.m, sizeof(g.model));
@@ -886,7 +1235,7 @@ void Renderer::Prepare(Task& task) {
                 ti.mask = 0xFF;
                 ti.instanceShaderBindingTableRecordOffset = 0;
                 ti.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-                ti.accelerationStructureReference = mesh->blasAddress;
+                ti.accelerationStructureReference = sp ? sp->blasAddress : mesh->blasAddress;
                 std::memcpy(&tlas[idx], &ti, sizeof(ti));
             }
 
@@ -895,6 +1244,10 @@ void Renderer::Prepare(Task& task) {
             const float r = mesh->boundRadius * model.MaxScale();
 
             uint8_t mask = 1;
+            if (skinned) {  // сфера меша — для позы по умолчанию, анимация из неё выходит: не отсекаем
+                m_visMask[idx] = 0x1F;
+                continue;
+            }
             for (const Vec4& p : planes)
                 if (p.x * c.x + p.y * c.y + p.z * c.z + p.w < -r) {
                     mask = 0;
@@ -931,7 +1284,13 @@ void Renderer::Prepare(Task& task) {
                 if (m_visMask[base + k] & bit)
                     out[written++] = base + k;
             if (written > first) {
-                draws.push_back({g % meshCount, first, written - first, g >= meshCount});
+                if (g < meshGroups) {
+                    draws.push_back({g % meshCount, first, written - first, g >= meshCount, VK_NULL_HANDLE});
+                } else {
+                    const SkinRef& sr = m_skinRefs[g - meshGroups];
+                    const bool twoSided = m_models->Get(world.At(sr.entity).model)->parts[sr.part].material.doubleSided;
+                    draws.push_back({sr.sp->mesh, first, written - first, twoSided, sr.sp->out.buffer});
+                }
                 drawn += written - first;
             }
         }
@@ -968,6 +1327,8 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
                    (m_rtSupported ? VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR : 0),
                VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
                    (m_rtSupported ? VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR : 0));
+
+    RecordSkinning(f);  // скиннутые вершины и их BLAS — до TLAS и отрисовки
 
     if (f.rt) {
         VkAccelerationStructureGeometryKHR geom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
@@ -1061,9 +1422,10 @@ void Renderer::Record(Frame& f, uint32_t imageIndex) {
         }
         const MeshGpu* mesh = m_meshes->Get(d.mesh);
         VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertices.buffer, &offset);
+        const VkBuffer vb = d.vertices ? d.vertices : mesh->vertices.buffer;  // скиннутые — свои вершины
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
         vkCmdBindIndexBuffer(cmd, mesh->indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, mesh->indexCount, d.count, 0, 0, d.first);  // один вызов на меш
+        vkCmdDrawIndexed(cmd, mesh->indexCount, d.count, 0, 0, d.first);  // один вызов на группу
     }
 
     vkCmdEndRendering(cmd);

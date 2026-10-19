@@ -28,10 +28,12 @@ MeshRegistry::~MeshRegistry() {
         m_gpu.Destroy(m.blasBuffer);
         m_gpu.Destroy(m.vertices);
         m_gpu.Destroy(m.indices);
+        m_gpu.Destroy(m.skin);
     }
 }
 
-uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const uint32_t* indices, size_t indexCount) {
+uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const uint32_t* indices, size_t indexCount,
+                              const SkinVertex* skin) {
     if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0)
         throw std::invalid_argument("Mesh::Create: пустой меш или число индексов не кратно 3");
     if (vertexCount > UINT32_MAX || indexCount > UINT32_MAX)
@@ -54,9 +56,10 @@ uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const 
 
     const VkDeviceSize vbSize = vertexCount * sizeof(Vertex);
     const VkDeviceSize ibSize = indexCount * sizeof(uint32_t);
-    VkBufferUsageFlags extra = 0;
+    // Адрес и storage — для вычислительного скиннинга (читает исходные вершины), build input — для BLAS
+    VkBufferUsageFlags extra = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (m_gpu.RayTracing())
-        extra = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        extra |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
 
     mesh.vertices = m_gpu.CreateBuffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra,
                                        MemUsage::GpuOnly, true);
@@ -78,15 +81,28 @@ uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const 
     mesh.boundCenter = center;
     mesh.boundRadius = std::sqrt(r2);
 
-    Buffer staging = m_gpu.CreateBuffer(vbSize + ibSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemUsage::Upload);
+    const VkDeviceSize skSize = skin ? vertexCount * sizeof(SkinVertex) : 0;
+    if (skin)
+        mesh.skin = m_gpu.CreateBuffer(skSize,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                       MemUsage::GpuOnly, true);
+
+    Buffer staging = m_gpu.CreateBuffer(vbSize + ibSize + skSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemUsage::Upload);
     std::memcpy(staging.mapped, vertices, vbSize);
     std::memcpy(static_cast<char*>(staging.mapped) + vbSize, indices, ibSize);
+    if (skin)
+        std::memcpy(static_cast<char*>(staging.mapped) + vbSize + ibSize, skin, skSize);
 
     m_lanes.Immediate(GpuLane::Transfer, [&](VkCommandBuffer cmd) {
         VkBufferCopy v{0, 0, vbSize};
         VkBufferCopy i{vbSize, 0, ibSize};
         vkCmdCopyBuffer(cmd, staging.buffer, mesh.vertices.buffer, 1, &v);
         vkCmdCopyBuffer(cmd, staging.buffer, mesh.indices.buffer, 1, &i);
+        if (skin) {
+            VkBufferCopy k{vbSize + ibSize, 0, skSize};
+            vkCmdCopyBuffer(cmd, staging.buffer, mesh.skin.buffer, 1, &k);
+        }
     });
     m_gpu.Destroy(staging);
 

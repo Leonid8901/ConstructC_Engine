@@ -3,6 +3,7 @@
 //   Prepare (стадия Prepare, Actor, параллельно): сбор инстансов по мешам, данные кадра, TLAS-инстансы.
 //   Render  (главный поток, Engine): TLAS build -> небо -> инстансированная отрисовка -> present.
 // Ray tracing — флаг: PBR-растеризация всегда, тени через ray query поверх, если флаг включён и GPU умеет.
+#include "Amper/Animation.h"
 #include "Amper/MeshRegistry.h"
 #include "Amper/ModelRegistry.h"
 #include "Amper/TextureRegistry.h"
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace ce {
@@ -25,6 +27,7 @@ namespace ce::core {
 
 class VulkanContext;
 class GpuLanes;
+struct EntityData;
 class Window;
 
 // Совпадает со struct Instance в shaders/common.glsl (std430, 144 байта)
@@ -125,14 +128,57 @@ private:
     struct Draw {
         uint32_t mesh, first, count;
         bool doubleSided;
+        VkBuffer vertices = VK_NULL_HANDLE;  // не пусто — свои вершины (скиннинг), индексы — меша
     };
+
+    // Часть модели со скином у конкретной сущности: свои скиннутые вершины и свой BLAS
+    struct SkinnedPart {
+        uint32_t part = 0;
+        uint32_t mesh = 0;
+        Buffer out;
+        Buffer blasBuffer, scratch;
+        VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
+        VkDeviceAddress blasAddress = 0;
+        bool built = false;
+        uint32_t jointBase = 0;  // в матрицах, в буфере костей кадра
+    };
+    // Состояние анимации сущности с анимированной моделью
+    struct Animator {
+        uint32_t entity = 0, gen = 0, model = 0;
+        uint32_t serial = UINT32_MAX;
+        int32_t clip = -1, prevClip = -1;
+        float time = 0, prevTime = 0, speed = 1;
+        bool loop = true, prevLoop = true, playing = false;
+        float fade = 0, fadeDur = 0;  // переход идёт, пока fade < fadeDur
+        Pose pose, prevPose;
+        std::vector<Mat4> globals;
+        std::vector<SkinnedPart> skinned;  // размер фиксирован после создания (на элементы держим указатели)
+        std::vector<uint32_t> skinBase;    // по скинам модели: начало палитры костей в буфере кадра
+        uint64_t seen = 0;
+    };
+    struct Retired {  // ресурсы удалённых аниматоров: освобождаем, когда кадры в полёте их отпустили
+        std::vector<SkinnedPart> parts;
+        uint64_t frame = 0;
+    };
+    struct SkinJob {  // push constants skin.comp (совпадает с шейдером)
+        VkDeviceAddress src, skin, joints, dst;
+        uint32_t count, pad;
+    };
+
     // Один инстанс к отрисовке: сущность целиком (меш) или часть её модели
     struct InstanceRef {
         uint32_t entity;
         uint32_t part;  // UINT32_MAX — меш сущности, иначе индекс части модели
         uint32_t key;   // группа отрисовки: doubleSided * meshCount + mesh
         uint32_t slot;  // номер внутри группы
+        const Animator* anim;  // не пусто — матрица узла из анимации
     };
+    struct SkinRef {
+        uint32_t entity;
+        uint32_t part;
+        SkinnedPart* sp;
+    };
+
     // Объём каскада в пространстве света: центр по X/Y, полуразмер и дальняя граница по глубине
     struct ShadowCull {
         Mat4 lightView;
@@ -156,6 +202,10 @@ private:
         bool shadows = false;
         std::vector<Draw> draws;                                // основной проход
         std::array<std::vector<Draw>, kCascades> shadowDraws;  // проходы каскадов
+        Buffer joints;  // палитры костей аниматоров (Stream, по адресу из skin.comp)
+        uint32_t jointCapacity = 0;
+        std::vector<SkinJob> skinJobs;
+        std::vector<SkinnedPart*> skinBlas;  // BLAS скиннутых частей к сборке/обновлению
     };
 
     void CreateFrames();
@@ -177,6 +227,13 @@ private:
     void WriteDescriptor(Frame& f, uint32_t binding);
     void HandleResize();
     void Record(Frame& f, uint32_t imageIndex);
+    Animator* SyncAnimator(uint32_t entity, const EntityData& d, const ModelData& md);
+    void CreateSkinnedPart(SkinnedPart& sp, const MeshGpu& mesh);
+    void DestroySkinnedPart(SkinnedPart& sp);
+    void Animate(Animator& a, float dt);
+    void RecordSkinning(Frame& f);
+    void CreateSkinPipeline();
+    void EnsureJointCapacity(Frame& f, uint32_t count);
 
     const VulkanContext& m_ctx;
     Gpu& m_gpu;
@@ -241,6 +298,13 @@ private:
 
     // Переиспользуемые буферы Prepare
     std::vector<InstanceRef> m_refs;
+    std::vector<SkinRef> m_skinRefs;
+    std::unordered_map<uint32_t, std::unique_ptr<Animator>> m_animators;  // по индексу сущности
+    std::vector<Animator*> m_activeAnimators;
+    std::vector<Retired> m_retired;
+    uint64_t m_prepareCount = 0;
+    VkPipelineLayout m_skinLayout = VK_NULL_HANDLE;
+    VkPipeline m_skinPipeline = VK_NULL_HANDLE;
     std::vector<uint32_t> m_meshCounts;   // по группам (2 * число мешей)
     std::vector<uint32_t> m_meshOffsets;
     std::vector<uint8_t> m_visMask;  // по инстансам: бит 0 — камера, биты 1..4 — каскады

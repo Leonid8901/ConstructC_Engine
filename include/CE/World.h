@@ -88,6 +88,11 @@ public:
     Vec3 BoundsMin() const;  // в координатах модели, поза по умолчанию
     Vec3 BoundsMax() const;
 
+    // Анимации (скелетные и узлов) из glTF
+    uint32_t AnimationCount() const;
+    std::string AnimationName(uint32_t index) const;
+    float AnimationDuration(uint32_t index) const;  // секунды
+
 private:
     friend struct core::Access;
     uint32_t m_id = UINT32_MAX;
@@ -119,6 +124,15 @@ public:
 
     Entity& SetMesh(Mesh mesh);
     Entity& SetModel(Model model);  // вместо меша; материалы берутся из модели, Material сущности не используется
+
+    // Анимации модели. fadeSeconds — плавный переход с того, что играло (0 — мгновенно).
+    // Имя ищется, когда команда применяется, поэтому SetModel(m).PlayAnimation("Walk") в одной цепочке работает.
+    Entity& PlayAnimation(const std::string& name, bool loop = true, float fadeSeconds = 0.2f);
+    Entity& PlayAnimation(uint32_t index, bool loop = true, float fadeSeconds = 0.2f);
+    Entity& StopAnimation(float fadeSeconds = 0.2f);  // плавно вернуться в позу по умолчанию
+    Entity& SetAnimationSpeed(float speed);           // 1 — как в файле, 0 — пауза, < 0 — назад
+    float AnimationTime() const;     // секунды с начала текущей анимации (на начало стадии)
+    bool AnimationPlaying() const;   // false — ничего не играет или однократная анимация закончилась
     Entity& SetMaterial(const Material& m);
     Entity& SetColor(Vec3 c);
     Entity& SetVisible(bool v);

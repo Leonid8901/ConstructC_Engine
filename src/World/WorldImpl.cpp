@@ -1,8 +1,10 @@
 #include "World/WorldImpl.h"
 #include "Core.h"
+#include "Amper/Renderer.h"
 #include "Grave/Physics.h"
 #include "UniX/Scheduler.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ce::core {
@@ -205,9 +207,37 @@ void WorldImpl::Apply(const Command& c) {
         d.model = UINT32_MAX;
         break;
     case CmdType::SetModel:
-        d.model = c.u;
+        if (d.model != c.u) {
+            d.model = c.u;
+            d.animClip = UINT32_MAX;
+            ++d.animSerial;
+        }
         d.mesh = UINT32_MAX;
         break;
+    case CmdType::PlayAnim: {
+        const ModelData* md = d.model == UINT32_MAX ? nullptr : Core().amper->Models().Get(d.model);
+        uint32_t clip = c.u;
+        if (md && !c.text.empty()) {
+            const int32_t found = md->FindClip(c.text);
+            clip = found >= 0 ? static_cast<uint32_t>(found) : UINT32_MAX;
+        }
+        if (!md || clip >= md->clips.size()) {
+            Log("PlayAnimation: " + std::string(md ? "нет анимации " : "у сущности нет модели, анимация ") +
+                (c.text.empty() ? std::to_string(c.u) : "\"" + c.text + "\""));
+            break;
+        }
+        d.animClip = clip;
+        d.animLoop = c.v.y != 0;
+        d.animFade = std::max(c.v.x, 0.0f);
+        ++d.animSerial;
+        break;
+    }
+    case CmdType::StopAnim:
+        d.animClip = UINT32_MAX;
+        d.animFade = std::max(c.v.x, 0.0f);
+        ++d.animSerial;
+        break;
+    case CmdType::SetAnimSpeed: d.animSpeed = c.v.x; break;
     case CmdType::SetMaterial: d.material = c.material; break;
     case CmdType::SetColor: d.material.color = c.v; break;
     case CmdType::SetVisible: d.visible = c.u != 0; break;

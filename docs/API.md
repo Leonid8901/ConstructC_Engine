@@ -9,6 +9,8 @@
 - [World](#world)
 - [Entity](#entity)
 - [Mesh](#mesh)
+- [Model](#model) и [анимации](#анимации)
+- [Texture](#texture)
 - [Material и Vertex](#material-и-vertex)
 - [Camera](#camera)
 - [Input](#input)
@@ -177,6 +179,9 @@ public:
     bool Valid() const;
     uint32_t PartCount() const;                  // сколько мешей с материалами (частей)
     Vec3 BoundsMin() const, BoundsMax() const;   // в координатах модели
+    uint32_t AnimationCount() const;             // анимации из файла
+    std::string AnimationName(uint32_t index) const;
+    float AnimationDuration(uint32_t index) const;  // секунды
 };
 
 Entity hero = World.Spawn().SetModel(Model::Load("assets/hero.glb")).SetPosition({0, 0, 0});
@@ -189,6 +194,32 @@ glTF 2.0: меши (треугольники), иерархия узлов, PBR-
 Загрузка синхронная (чтение, декодирование картинок, мипы, загрузка на GPU). Большие модели удобно грузить из фоновой задачи: `UniX.CreateTask.Once("Load", Cost::Extreme, ...)`.
 
 Физика с моделью: тело задаётся формой как обычно; размер удобно взять из `BoundsMin/BoundsMax`.
+
+### Анимации
+
+Скелетные анимации (скины) и анимации узлов из glTF: каналы translation/rotation/scale, интерполяция LINEAR, STEP и CUBICSPLINE.
+
+| Метод `Entity` | Описание |
+|---|---|
+| `PlayAnimation(const std::string& name, bool loop = true, float fadeSeconds = 0.2f)` | запустить по имени; плавный переход с того, что играло |
+| `PlayAnimation(uint32_t index, bool loop = true, float fadeSeconds = 0.2f)` | то же по номеру |
+| `StopAnimation(float fadeSeconds = 0.2f)` | плавно вернуться в позу по умолчанию |
+| `SetAnimationSpeed(float speed)` | 1 — как в файле, 0 — пауза, < 0 — назад |
+| `float AnimationTime()` | секунды с начала текущей анимации |
+| `bool AnimationPlaying()` | `false` — ничего не играет или однократная закончилась (стоит на последнем кадре) |
+
+```cpp
+Model fox = Model::Load("assets/Fox.glb");
+Entity e = World.Spawn().SetModel(fox).SetScale(0.02f).PlayAnimation("Walk");
+// позже, из задачи:
+e.PlayAnimation("Run", true, 0.3f);   // переход за 0,3 с
+```
+
+Имя ищется, когда команда применяется, поэтому `SetModel(m).PlayAnimation("Walk")` в одной цепочке работает. Неизвестное имя — сообщение в логе, анимация не меняется. Смена модели сбрасывает анимацию. Состояние анимации не сбрасывается при `SetVisible(false)`.
+
+Как это работает: поза считается на CPU в стадии Prepare (параллельно по сущностям), скиннинг — вычислительным шейдером на GPU в свои вершины сущности; их берут растеризация, карты теней и BLAS для RT-теней (BLAS обновляется, а не строится заново). Подробности — [Amper.md](Amper.md#51-анимации).
+
+Не поддерживается: морфинг (morph targets), больше 4 костей на вершину (`JOINTS_1`), смешивание нескольких анимаций одновременно (кроме перехода), события на кадрах анимации.
 
 ## Texture
 

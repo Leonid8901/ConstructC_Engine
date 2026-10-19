@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace ce::core {
@@ -34,11 +35,22 @@ struct EntityData {
     bool homeExplicit = false;  // задана SetRespawnPoint — AddBody её не перезаписывает
     bool moves = false;         // динамическое или кинематическое тело
     OutOfBounds oob = OutOfBounds::Default;
+
+    // Анимация: команды игры -> Amper
+    uint32_t animClip = UINT32_MAX;  // UINT32_MAX — поза по умолчанию
+    uint32_t animSerial = 0;         // растёт с каждой командой Play/Stop: Amper начинает переход
+    float animFade = 0.2f;
+    float animSpeed = 1.0f;
+    bool animLoop = true;
+    // Обратная связь от Amper (пишется в стадии Prepare)
+    float animTime = 0;
+    bool animPlaying = false;
 };
 
 enum class CmdType : uint8_t {
     Create, Destroy, SetPos, SetRot, SetScale, SetMesh, SetMaterial, SetColor, SetVisible,
-    AddBody, RemoveBody, SetVel, SetAngVel, AddForce, AddImpulse, SetOutOfBounds, SetHome, SetModel
+    AddBody, RemoveBody, SetVel, SetAngVel, AddForce, AddImpulse, SetOutOfBounds, SetHome, SetModel,
+    PlayAnim, StopAnim, SetAnimSpeed
 };
 
 struct WorldBounds {
@@ -57,6 +69,7 @@ struct Command {
     uint32_t u = 0;
     Material material;
     BodyDesc body;
+    std::string text;  // имя анимации
 };
 
 struct CameraState {

@@ -95,6 +95,18 @@ Vec3 Model::BoundsMax() const {
     const auto* m = ModelOf(m_id);
     return m ? m->boundsMax : Vec3{};
 }
+uint32_t Model::AnimationCount() const {
+    const auto* m = ModelOf(m_id);
+    return m ? static_cast<uint32_t>(m->clips.size()) : 0;
+}
+std::string Model::AnimationName(uint32_t index) const {
+    const auto* m = ModelOf(m_id);
+    return m && index < m->clips.size() ? m->clips[index].name : std::string{};
+}
+float Model::AnimationDuration(uint32_t index) const {
+    const auto* m = ModelOf(m_id);
+    return m && index < m->clips.size() ? m->clips[index].duration : 0.0f;
+}
 
 // ---------------- Mesh ----------------
 

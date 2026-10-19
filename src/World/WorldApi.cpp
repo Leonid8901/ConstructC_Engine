@@ -84,6 +84,47 @@ Entity& Entity::SetModel(Model model) {
     return *this;
 }
 
+Entity& Entity::PlayAnimation(const std::string& name, bool loop, float fadeSeconds) {
+    Command c = Cmd(CmdType::PlayAnim, *this);
+    c.u = UINT32_MAX;
+    c.text = name;
+    c.v = {fadeSeconds, loop ? 1.0f : 0.0f, 0};
+    W().Submit(c);
+    return *this;
+}
+
+Entity& Entity::PlayAnimation(uint32_t index, bool loop, float fadeSeconds) {
+    Command c = Cmd(CmdType::PlayAnim, *this);
+    c.u = index;
+    c.v = {fadeSeconds, loop ? 1.0f : 0.0f, 0};
+    W().Submit(c);
+    return *this;
+}
+
+Entity& Entity::StopAnimation(float fadeSeconds) {
+    Command c = Cmd(CmdType::StopAnim, *this);
+    c.v = {fadeSeconds, 0, 0};
+    W().Submit(c);
+    return *this;
+}
+
+Entity& Entity::SetAnimationSpeed(float speed) {
+    Command c = Cmd(CmdType::SetAnimSpeed, *this);
+    c.v = {speed, 0, 0};
+    W().Submit(c);
+    return *this;
+}
+
+float Entity::AnimationTime() const {
+    auto* d = W().TryGet(m_index, m_gen);
+    return d ? d->animTime : 0.0f;
+}
+
+bool Entity::AnimationPlaying() const {
+    auto* d = W().TryGet(m_index, m_gen);
+    return d && d->animPlaying;
+}
+
 Entity& Entity::SetMaterial(const Material& m) {
     Command c = Cmd(CmdType::SetMaterial, *this);
     c.material = m;

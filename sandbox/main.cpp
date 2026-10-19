@@ -53,8 +53,13 @@ public:
                 const Vec3 lo = m.BoundsMin(), hi = m.BoundsMax();
                 const float size = std::max(hi.x - lo.x, std::max(hi.y - lo.y, hi.z - lo.z));
                 const float s = size > 0 ? 2.5f / size : 1.0f;  // вписываем в 2,5 м
-                World.Spawn().SetModel(m).SetScale(s).SetPosition({0, -lo.y * s, 4});
-                std::printf("[game] модель %s: частей %u\n", g_modelPath.c_str(), m.PartCount());
+                Entity e = World.Spawn().SetModel(m).SetScale(s).SetPosition({0, -lo.y * s, 4});
+                std::printf("[game] модель %s: частей %u, анимаций %u\n", g_modelPath.c_str(), m.PartCount(),
+                            m.AnimationCount());
+                if (m.AnimationCount() > 0) {  // играем первую по кругу
+                    e.PlayAnimation(0u);
+                    std::printf("[game] анимация: %s (%.2f с)\n", m.AnimationName(0).c_str(), m.AnimationDuration(0));
+                }
             } catch (const std::exception& e) {
                 std::printf("[game] не удалось загрузить модель: %s\n", e.what());
             }
