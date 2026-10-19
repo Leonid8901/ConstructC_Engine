@@ -37,9 +37,10 @@ struct EngineCore {
     EngineConfig config;  // итоговая: после профиля железа и engine.json
     SystemInfo system;
     std::atomic<bool> quit{false};
-    double time = 0;
-    float dt = 0;
-    uint64_t frame = 0;
+    // atomic: читаются из фоновых задач, пока главный поток начинает кадр
+    std::atomic<double> time{0};
+    std::atomic<float> dt{0};
+    std::atomic<uint64_t> frame{0};
 };
 
 EngineCore* CorePtr();
@@ -67,6 +68,16 @@ struct Access {
 
     static Mesh MakeMesh(uint32_t id) {
         Mesh m;
+        m.m_id = id;
+        return m;
+    }
+    static Texture MakeTexture(uint32_t id) {
+        Texture t;
+        t.m_id = id;
+        return t;
+    }
+    static Model MakeModel(uint32_t id) {
+        Model m;
         m.m_id = id;
         return m;
     }

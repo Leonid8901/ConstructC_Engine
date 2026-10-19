@@ -325,7 +325,6 @@ void LowerCurrentThreadPriority() {
 }
 
 void ShowFatalError(const std::string& title, const std::string& message) {
-    std::cerr << "[CE] " << title << ": " << message << std::endl;
 #ifdef _WIN32
     auto wide = [](const std::string& s) {
         const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -334,6 +333,9 @@ void ShowFatalError(const std::string& title, const std::string& message) {
         return w;
     };
     MessageBoxW(nullptr, wide(message).c_str(), wide(title).c_str(), MB_OK | MB_ICONERROR);
+#else
+    (void)title;  // в Linux сообщение уже в логе (stdout/stderr), окна не показываем
+    (void)message;
 #endif
 }
 

@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <locale>
 #include <map>
+#include <tuple>
 #include <sstream>
 #include <stdexcept>
 
@@ -25,12 +28,21 @@ MeshRegistry::~MeshRegistry() {
         m_gpu.Destroy(m.blasBuffer);
         m_gpu.Destroy(m.vertices);
         m_gpu.Destroy(m.indices);
+        m_gpu.Destroy(m.skin);
     }
 }
 
-uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const uint32_t* indices, size_t indexCount) {
+uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const uint32_t* indices, size_t indexCount,
+                              const SkinVertex* skin) {
     if (vertexCount == 0 || indexCount == 0 || indexCount % 3 != 0)
         throw std::invalid_argument("Mesh::Create: пустой меш или число индексов не кратно 3");
+    if (vertexCount > UINT32_MAX || indexCount > UINT32_MAX)
+        throw std::invalid_argument("Mesh::Create: больше 2^32 вершин/индексов");
+    // Индекс за пределами вершин — чтение чужой памяти на GPU (в лучшем случае мусор, в худшем device lost)
+    for (size_t k = 0; k < indexCount; ++k)
+        if (indices[k] >= vertexCount)
+            throw std::invalid_argument("Mesh::Create: индекс " + std::to_string(indices[k]) + " >= числа вершин " +
+                                        std::to_string(vertexCount));
 
     uint32_t id = m_count.load();
     // слот резервируется атомарно; меш станет видимым рендеру только после ready=true
@@ -44,9 +56,10 @@ uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const 
 
     const VkDeviceSize vbSize = vertexCount * sizeof(Vertex);
     const VkDeviceSize ibSize = indexCount * sizeof(uint32_t);
-    VkBufferUsageFlags extra = 0;
+    // Адрес и storage — для вычислительного скиннинга (читает исходные вершины), build input — для BLAS
+    VkBufferUsageFlags extra = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (m_gpu.RayTracing())
-        extra = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        extra |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
 
     mesh.vertices = m_gpu.CreateBuffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra,
                                        MemUsage::GpuOnly, true);
@@ -68,22 +81,34 @@ uint32_t MeshRegistry::Create(const Vertex* vertices, size_t vertexCount, const 
     mesh.boundCenter = center;
     mesh.boundRadius = std::sqrt(r2);
 
-    Buffer staging = m_gpu.CreateBuffer(vbSize + ibSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemUsage::Upload);
+    const VkDeviceSize skSize = skin ? vertexCount * sizeof(SkinVertex) : 0;
+    if (skin)
+        mesh.skin = m_gpu.CreateBuffer(skSize,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                       MemUsage::GpuOnly, true);
+
+    Buffer staging = m_gpu.CreateBuffer(vbSize + ibSize + skSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemUsage::Upload);
     std::memcpy(staging.mapped, vertices, vbSize);
     std::memcpy(static_cast<char*>(staging.mapped) + vbSize, indices, ibSize);
+    if (skin)
+        std::memcpy(static_cast<char*>(staging.mapped) + vbSize + ibSize, skin, skSize);
 
     m_lanes.Immediate(GpuLane::Transfer, [&](VkCommandBuffer cmd) {
         VkBufferCopy v{0, 0, vbSize};
         VkBufferCopy i{vbSize, 0, ibSize};
         vkCmdCopyBuffer(cmd, staging.buffer, mesh.vertices.buffer, 1, &v);
         vkCmdCopyBuffer(cmd, staging.buffer, mesh.indices.buffer, 1, &i);
+        if (skin) {
+            VkBufferCopy k{vbSize + ibSize, 0, skSize};
+            vkCmdCopyBuffer(cmd, staging.buffer, mesh.skin.buffer, 1, &k);
+        }
     });
     m_gpu.Destroy(staging);
 
     if (m_gpu.RayTracing())
         BuildBlas(mesh);
 
-    m_newResources.store(true);
     mesh.ready.store(true, std::memory_order_release);
     return id;
 }
@@ -163,6 +188,7 @@ uint32_t MeshRegistry::Primitive(const std::string& key,
     std::vector<Vertex> v;
     std::vector<uint32_t> i;
     gen(v, i);
+    ComputeTangents(v, i);
     uint32_t id = Create(v.data(), v.size(), i.data(), i.size());
     m_primitives.emplace(key, id);
     return id;
@@ -181,7 +207,7 @@ void MeshRegistry::GenCube(std::vector<Vertex>& v, std::vector<uint32_t>& idx) {
         uint32_t base = static_cast<uint32_t>(v.size());
         const float s[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
         for (auto& c : s)
-            v.push_back({(f.n + f.u * c[0] + f.w * c[1]) * 0.5f, f.n});
+            v.push_back({(f.n + f.u * c[0] + f.w * c[1]) * 0.5f, f.n, {(c[0] + 1) * 0.5f, 1 - (c[1] + 1) * 0.5f}});
         idx.insert(idx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
     }
 }
@@ -209,7 +235,7 @@ void GenLatLong(std::vector<Vertex>& v, std::vector<uint32_t>& idx, float radius
             Vec3 n{std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph)};
             Vec3 p = n * radius;
             p.y += top ? halfHeight : -halfHeight;
-            v.push_back({p, n});
+            v.push_back({p, n, {static_cast<float>(s) / static_cast<float>(segments), th / kPi}});
         }
     }
     const uint32_t stride = segments + 1;
@@ -236,70 +262,113 @@ void MeshRegistry::GenCapsule(std::vector<Vertex>& v, std::vector<uint32_t>& idx
 void MeshRegistry::GenPlane(std::vector<Vertex>& v, std::vector<uint32_t>& idx, float size) {
     float h = size * 0.5f;
     Vec3 n{0, 1, 0};
-    v = {{{-h, 0, -h}, n}, {{-h, 0, h}, n}, {{h, 0, h}, n}, {{h, 0, -h}, n}};
+    // UV в метрах: текстура повторяется каждый метр (масштаб — Material::uvScale)
+    v = {{{-h, 0, -h}, n, {0, 0}}, {{-h, 0, h}, n, {0, size}}, {{h, 0, h}, n, {size, size}}, {{h, 0, -h}, n, {size, 0}}};
     idx = {0, 1, 2, 0, 2, 3};
 }
 
-// Минимальный OBJ: v, vn, f (треугольники и n-угольники веером). Без нормалей — плоские нормали.
+// OBJ: v, vt, vn, f (треугольники и n-угольники веером; v, v/vt, v//vn, v/vt/vn; отрицательные индексы).
+// Грань без нормалей получает плоскую нормаль. vt переворачивается по V (в OBJ начало снизу, у нас сверху).
 bool MeshRegistry::LoadObj(const std::string& path, std::vector<Vertex>& out, std::vector<uint32_t>& idx) {
-    std::ifstream file(path);
+    std::ifstream file(std::filesystem::path(reinterpret_cast<const char8_t*>(path.c_str())));
     if (!file)
         return false;
     std::vector<Vec3> pos, nrm;
-    std::map<std::pair<int, int>, uint32_t> cache;
-    bool hasNormals = true;
+    std::vector<Vec2> uvs;
+    std::map<std::tuple<int, int, int>, uint32_t> cache;
     std::string line;
-    std::vector<std::pair<int, int>> face;
+    std::vector<std::tuple<int, int, int>> face;
+    auto toIndex = [](const std::string& s, size_t count) -> int {
+        if (s.empty())
+            return -1;
+        int i = std::stoi(s);
+        return i < 0 ? static_cast<int>(count) + i : i - 1;  // 1-based; -1 = последний
+    };
+    uint32_t lineNo = 0;
     while (std::getline(file, line)) {
+        ++lineNo;
         std::istringstream ss(line);
+        ss.imbue(std::locale::classic());
         std::string tag;
         ss >> tag;
         if (tag == "v") {
             Vec3 p; ss >> p.x >> p.y >> p.z; pos.push_back(p);
+        } else if (tag == "vt") {
+            Vec2 t; ss >> t.x >> t.y; uvs.push_back({t.x, 1.0f - t.y});
         } else if (tag == "vn") {
             Vec3 n; ss >> n.x >> n.y >> n.z; nrm.push_back(Normalize(n));
         } else if (tag == "f") {
             face.clear();
             std::string tok;
             while (ss >> tok) {
-                int vi = 0, ni = 0;
-                size_t s1 = tok.find('/');
-                vi = std::stoi(tok.substr(0, s1));
-                if (s1 != std::string::npos) {
-                    size_t s2 = tok.find('/', s1 + 1);
-                    if (s2 != std::string::npos && s2 + 1 < tok.size())
-                        ni = std::stoi(tok.substr(s2 + 1));
-                }
-                if (vi < 0) vi = static_cast<int>(pos.size()) + vi + 1;
-                if (ni < 0) ni = static_cast<int>(nrm.size()) + ni + 1;
-                if (ni == 0) hasNormals = false;
-                face.emplace_back(vi - 1, ni - 1);
+                const size_t s1 = tok.find('/');
+                const size_t s2 = s1 == std::string::npos ? std::string::npos : tok.find('/', s1 + 1);
+                const int vi = toIndex(tok.substr(0, s1), pos.size());
+                const int ti = s1 == std::string::npos ? -1 : toIndex(tok.substr(s1 + 1, s2 == std::string::npos ? std::string::npos : s2 - s1 - 1), uvs.size());
+                const int ni = s2 == std::string::npos ? -1 : toIndex(tok.substr(s2 + 1), nrm.size());
+                if (vi < 0 || vi >= static_cast<int>(pos.size()) || ti >= static_cast<int>(uvs.size()) ||
+                    ni >= static_cast<int>(nrm.size()))
+                    throw std::runtime_error(path + ":" + std::to_string(lineNo) + ": индекс вне диапазона");
+                face.emplace_back(vi, ti, ni);
             }
-            for (size_t k = 1; k + 1 < face.size(); ++k)
-                for (auto key : {face[0], face[k], face[k + 1]}) {
-                    if (!hasNormals) {  // без нормалей — каждая вершина своя (плоское затенение)
-                        out.push_back({pos.at(key.first), Vec3{}});
+            bool flat = false;
+            for (auto& f : face)
+                flat |= std::get<2>(f) < 0;
+            for (size_t k = 1; k + 1 < face.size(); ++k) {
+                const auto tri = {face[0], face[k], face[k + 1]};
+                if (flat) {  // плоская нормаль; вершины этой грани не делятся с соседями
+                    const Vec3 a = pos[std::get<0>(face[0])], b = pos[std::get<0>(face[k])], c = pos[std::get<0>(face[k + 1])];
+                    const Vec3 n = Normalize(Cross(b - a, c - a));
+                    for (auto key : tri) {
+                        const int ti = std::get<1>(key);
+                        out.push_back({pos[std::get<0>(key)], n, ti >= 0 ? uvs[ti] : Vec2{}});
                         idx.push_back(static_cast<uint32_t>(out.size() - 1));
-                        continue;
                     }
+                    continue;
+                }
+                for (auto key : tri) {
                     auto it = cache.find(key);
                     if (it == cache.end()) {
-                        out.push_back({pos.at(key.first), nrm.at(key.second)});
+                        const int ti = std::get<1>(key);
+                        out.push_back({pos[std::get<0>(key)], nrm[std::get<2>(key)], ti >= 0 ? uvs[ti] : Vec2{}});
                         it = cache.emplace(key, static_cast<uint32_t>(out.size() - 1)).first;
                     }
                     idx.push_back(it->second);
                 }
+            }
         }
     }
-    if (!hasNormals)
-        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
-            Vertex& a = out[idx[i]];
-            Vertex& b = out[idx[i + 1]];
-            Vertex& c = out[idx[i + 2]];
-            Vec3 n = Normalize(Cross(b.position - a.position, c.position - a.position));
-            a.normal = b.normal = c.normal = n;
-        }
     return !idx.empty();
+}
+
+// Касательные по UV (накопление по треугольникам + ортогонализация Грама — Шмидта).
+// Без UV или с вырожденными UV — любой перпендикуляр к нормали.
+void MeshRegistry::ComputeTangents(std::vector<Vertex>& v, const std::vector<uint32_t>& idx) {
+    std::vector<Vec3> tan(v.size()), bit(v.size());
+    for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+        const uint32_t a = idx[i], b = idx[i + 1], c = idx[i + 2];
+        const Vec3 e1 = v[b].position - v[a].position, e2 = v[c].position - v[a].position;
+        const Vec2 d1 = v[b].uv - v[a].uv, d2 = v[c].uv - v[a].uv;
+        const float det = d1.x * d2.y - d2.x * d1.y;
+        if (std::fabs(det) < 1e-12f)
+            continue;
+        const float r = 1.0f / det;
+        const Vec3 t = (e1 * d2.y - e2 * d1.y) * r;
+        const Vec3 bt = (e2 * d1.x - e1 * d2.x) * r;
+        for (uint32_t k : {a, b, c}) {
+            tan[k] += t;
+            bit[k] += bt;
+        }
+    }
+    for (size_t k = 0; k < v.size(); ++k) {
+        const Vec3 n = v[k].normal;
+        Vec3 t = tan[k] - n * Dot(n, tan[k]);
+        if (LengthSq(t) < 1e-12f)  // нет UV: любой перпендикуляр
+            t = Cross(n, std::fabs(n.y) < 0.99f ? Vec3{0, 1, 0} : Vec3{1, 0, 0});
+        t = Normalize(t);
+        const float w = Dot(Cross(n, t), bit[k]) < 0.0f ? -1.0f : 1.0f;
+        v[k].tangent = {t, w};
+    }
 }
 
 } // namespace ce::core

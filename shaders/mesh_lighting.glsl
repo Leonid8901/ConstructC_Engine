@@ -1,5 +1,6 @@
 // Тело фрагментного шейдера Amper. AMPER_RT включает тени через ray query.
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
 #ifdef AMPER_RT
 #extension GL_EXT_ray_query : require
 #endif
@@ -52,7 +53,14 @@ float SunVisibility(vec3 pos, vec3 N, vec3 L) {
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) flat in uint vInstance;
+layout(location = 3) in vec2 vUV;
+layout(location = 4) in vec4 vTangent;
 layout(location = 0) out vec4 outColor;
+
+// Все текстуры движка (bindless): индекс берётся из инстанса
+layout(set = 1, binding = 0) uniform sampler2D textures[];
+
+vec4 Tex(uint index, vec2 uv) { return texture(textures[nonuniformEXT(index)], uv); }
 
 const float PI = 3.14159265;
 
@@ -77,10 +85,39 @@ vec3 Brdf(vec3 N, vec3 V, vec3 L, vec3 albedo, float rough, float metal, vec3 F0
 
 void main() {
     Instance inst = instances[vInstance];
-    vec3 albedo = inst.colorRough.rgb;
-    float rough = clamp(inst.colorRough.w, 0.04, 1.0);
-    float metal = clamp(inst.emissiveMetal.w, 0.0, 1.0);
+    vec4 base = vec4(inst.colorRough.rgb, 1.0);
+    if (inst.tex.x != NO_TEXTURE)
+        base *= Tex(inst.tex.x, vUV);
+    if (inst.params.y > 0.0 && base.a < inst.params.y)
+        discard;  // alphaCutoff: листва, решётки
+    vec3 albedo = base.rgb;
+    float rough = inst.colorRough.w;
+    float metal = inst.emissiveMetal.w;
+    if (inst.tex.y != NO_TEXTURE) {
+        vec4 mr = Tex(inst.tex.y, vUV);  // glTF: G — roughness, B — metallic
+        rough *= mr.g;
+        metal *= mr.b;
+    }
+    rough = clamp(rough, 0.04, 1.0);
+    metal = clamp(metal, 0.0, 1.0);
+
     vec3 N = normalize(vNormal);
+    if (!gl_FrontFacing)
+        N = -N;  // двусторонние материалы: обратная сторона освещается своей нормалью
+    if (inst.tex.z != NO_TEXTURE) {
+        vec3 T = vTangent.xyz - N * dot(N, vTangent.xyz);
+        if (dot(T, T) > 1e-12) {
+            T = normalize(T);
+            vec3 B = cross(N, T) * (vTangent.w < 0.0 ? -1.0 : 1.0);
+            vec3 tn = Tex(inst.tex.z, vUV).xyz * 2.0 - 1.0;
+            tn.xy *= inst.params.x;  // normalScale
+            N = normalize(mat3(T, B, N) * tn);
+        }
+    }
+    float ao = 1.0;
+    uint occTex = floatBitsToUint(inst.params.w);
+    if (occTex != NO_TEXTURE)
+        ao = 1.0 + inst.params.z * (Tex(occTex, vUV).r - 1.0);
     vec3 V = normalize(frame.camPos.xyz - vWorldPos);
     vec3 F0 = mix(vec3(0.04), albedo, metal);
     vec3 origin = vWorldPos + N * 0.02;
@@ -116,9 +153,12 @@ void main() {
     vec3 R = reflect(-V, N);
     vec3 sky = R.y >= 0.0 ? mix(frame.skyHorizon.rgb, frame.skyZenith.rgb, sqrt(R.y)) : frame.skyHorizon.rgb * 0.3;
     vec3 Fr = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
-    color += frame.ambient.rgb * mix(0.45, 1.0, N.y * 0.5 + 0.5) * albedo * (1.0 - metal);
-    color += sky * Fr * (1.0 - 0.7 * rough) * 0.8;
-    color += inst.emissiveMetal.rgb;
+    color += frame.ambient.rgb * mix(0.45, 1.0, N.y * 0.5 + 0.5) * albedo * (1.0 - metal) * ao;
+    color += sky * Fr * (1.0 - 0.7 * rough) * 0.8 * ao;
+    vec3 emissive = inst.emissiveMetal.rgb;
+    if (inst.tex.w != NO_TEXTURE)
+        emissive *= Tex(inst.tex.w, vUV).rgb;
+    color += emissive;
 
     outColor = vec4(Tonemap(color), 1.0);
 }
